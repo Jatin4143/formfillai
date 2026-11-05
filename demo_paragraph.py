@@ -25,22 +25,16 @@ from pathlib import Path
 
 import ollama
 import streamlit as st
+import multi_form_planner as mfp
 
-ENV_FILE = Path(__file__).resolve().parent / ".env"
-if ENV_FILE.exists():
-    with open(ENV_FILE, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1)
-                os.environ.setdefault(k.strip(), v.strip().strip("'\""))
-
-MODEL = os.getenv("MODEL")
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11435")
-ollama_client = ollama.Client(host=OLLAMA_BASE_URL)
-DB_PATH = Path(__file__).resolve().parent / "forms.db"
-APP_NAME = "FieldFlow"
-APP_TAGLINE = "Fill any form from chat"
+from config import (
+    MODEL,
+    OLLAMA_BASE_URL,
+    DB_PATH,
+    APP_NAME,
+    APP_TAGLINE,
+    ollama_client,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -286,29 +280,11 @@ def is_cancel_command(text: str) -> bool:
     return bool(CANCEL_RE.match(text.strip().lower()))
 
 
-def build_greeting_reply(forms, user_text=None):
-    """Return a short, clean greeting with step-by-step form options dynamically summarized."""
-    greeting_prefix = "Hello! I can help you fill out the following forms:\n"
+def build_greeting_reply(forms=None, user_text=None):
+    """Return a natural, 1-sentence model-side conversational reply."""
     if user_text:
-        lower = user_text.lower()
-        if "morning" in lower:
-            greeting_prefix = "Good morning! I can help you fill out the following forms:\n"
-        elif "evening" in lower:
-            greeting_prefix = "Good evening! I can help you fill out the following forms:\n"
-        elif "afternoon" in lower:
-            greeting_prefix = "Good afternoon! I can help you fill out the following forms:\n"
-
-    lines = [greeting_prefix]
-    for idx, f in enumerate(forms, 1):
-        schema = fetch_form_schema(f["key"])
-        desc_str = ""
-        if schema and schema.get("schema") and schema["schema"].get("fields"):
-            field_labels = [fld["label"] for fld in schema["schema"]["fields"][:3]]
-            desc_str = f" - ({', '.join(field_labels)}...)"
-        lines.append(f"{idx}. {f['form_name']}{desc_str}")
-
-    lines.append("\nPlease reply with the form name you want to fill, or provide details directly.")
-    return "\n".join(lines)
+        return mfp.generate_conversational_reply(user_text)
+    return "Hello! I am here to help you fill out forms, register visitors, or report maintenance requests. How can I assist you today?"
 
 
 def build_form_overview_message(form, accepted=None):
@@ -316,18 +292,15 @@ def build_form_overview_message(form, accepted=None):
     schema = form["schema"]
     form_name = form["form_name"]
 
-    lines = [f"Let's fill out {form_name}.\n"]
-
-    if accepted:
+    real_accepted = {k: v for k, v in (accepted or {}).items() if v is not None and str(v).strip() != "" and str(v).lower() != "null"}
+    if real_accepted:
+        lines = [f"Let's fill out **{form_name}**.\n"]
         lines.append("Captured from your message:")
         for field in schema["fields"]:
-            if field["name"] in accepted:
-                val = accepted[field["name"]]
-                if val is None:
-                    val = "Skipped"
-                lines.append(f"- {field['label']}: {val}")
+            if field["name"] in real_accepted:
+                lines.append(f"- {field['label']}: {real_accepted[field['name']]}")
 
-        remaining = [f for f in schema["fields"] if f["name"] not in accepted]
+        remaining = [f for f in schema["fields"] if f["name"] not in real_accepted]
         if remaining:
             lines.append("")
             lines.append("Still needed:")
@@ -338,26 +311,7 @@ def build_form_overview_message(form, accepted=None):
                 lines.append(f"{idx}. {field['label']} [{req_tag}]{opts_str}")
         return "\n".join(lines)
 
-    lines.append("Details needed:")
-    for idx, field in enumerate(schema["fields"], 1):
-        req_tag = "Required" if field.get("required", True) else "Optional"
-        options = field.get("options")
-        name_lower = field.get("name", "").lower()
-        if options and field.get("type") == "select":
-            opts_str = f" ({', '.join(options)})"
-        elif "email" in name_lower:
-            opts_str = " (e.g. name@example.com)"
-        elif "vehicle" in name_lower or "plate" in name_lower:
-            opts_str = " (e.g. MH12AB1234)"
-        elif "phone" in name_lower or "mobile" in name_lower:
-            opts_str = " (e.g. +91 9876543210)"
-        else:
-            opts_str = ""
-        lines.append(f"{idx}. {field['label']} [{req_tag}]{opts_str}")
-
-    lines.append("")
-    lines.append("You can provide all these details in one message, or answer them one by one.")
-    return "\n".join(lines)
+    return f"Let's fill out **{form_name}**."
 
 
 # ---------------------------------------------------------------------------
@@ -602,22 +556,12 @@ def submit_form(form_id, answers):
 # ---------------------------------------------------------------------------
 
 FORM_INTENT_PREFIXES_RE = re.compile(
-    r"^(i\s+want\s+to\s+(?:fill|raise|open|create|start|make|submit|lodge)\s+(?:a\s+|the\s+)?|"
-    r"i\s+would\s+like\s+to\s+(?:fill|raise|open|create|start)\s+(?:a\s+|the\s+)?|"
-    r"can\s+i\s+(?:fill|raise|open|create|start)\s+(?:a\s+|the\s+)?|"
-    r"let(?:'s|s)?\s+(?:fill|start|open|create)\s+(?:a\s+|the\s+)?|"
-    r"please\s+(?:fill|open|start|create|raise)\s+(?:a\s+|the\s+)?|"
-    r"help\s+me\s+(?:fill|open|start)\s+(?:a\s+|the\s+)?|"
-    r"fill\s+(?:out|up)?\s+(?:a\s+|the\s+)?|"
-    r"start\s+(?:with)?\s+(?:a\s+|the\s+)?|"
-    r"open\s+(?:a\s+|the\s+)?|"
-    r"create\s+(?:a\s+|the\s+)?|"
-    r"new\s+)",
-    re.IGNORECASE
+    r"^(?:(?:hi|hey|hello|please|can\s+you|could\s+you|i\s+want\s+to|i\s+would\s+like\s+to|i\s+need\s+to|help\s+me(?:\s+to|\s+with)?|can\s+you\s+help\s+me(?:\s+to|\s+with)?|with|let(?:\'s|s)?|start|open|fill(?:\s+out|\s+up)?|create|new|raise|lodge|register|submit|do|make)\s+)+(?:a\s+|an\s+|the\s+)?",
+    re.IGNORECASE,
 )
 FORM_INTENT_SUFFIXES_RE = re.compile(
-    r"(\s+form|\s+please|\s+now)+$",
-    re.IGNORECASE
+    r"(?:\s+(?:form|please|now|entry))+$",
+    re.IGNORECASE,
 )
 
 
@@ -657,15 +601,28 @@ def message_is_only_form_name(user_text, form):
     """True when the message only picks a form and has no field values."""
     raw_clean = user_text.strip().lower().strip(" .,!?:;\"'")
     cleaned = clean_form_selection_text(user_text)
-    names = [str(form["form_name"]).strip().lower(), str(form["key"]).strip().lower()]
+    names = {str(form["form_name"]).strip().lower(), str(form["key"]).strip().lower()}
     for alias in form.get("aliases", []):
-        names.append(str(alias).strip().lower())
-    return raw_clean in names or cleaned in names
+        names.add(str(alias).strip().lower())
+
+    if raw_clean in names or cleaned in names:
+        return True
+
+    for n in names:
+        if cleaned and (n == cleaned or (n.startswith(cleaned) and len(cleaned) >= 4)):
+            return True
+
+    return False
 
 
 def get_next_field(schema, answers):
+    answers_dict = answers or {}
     for field in schema["fields"]:
-        if field["name"] not in answers:
+        fname = field["name"]
+        if fname not in answers_dict:
+            return field
+        val = answers_dict[fname]
+        if field.get("required", True) and (val is None or str(val).strip() == ""):
             return field
     return None
 
@@ -1642,14 +1599,9 @@ Reply politely in 1 or 2 SHORT sentences maximum. Do not write essays or long li
 
 
 def handle_form_selection(user_text):
-    short = get_short_reply(user_text)
-    if short:
-        st.session_state.messages.append({"role": "assistant", "content": short})
-        sync_active_chat()
-        return
-
-    if is_greeting_or_smalltalk(user_text):
-        reply = build_greeting_reply(list_forms(), user_text=user_text)
+    if is_greeting_or_smalltalk(user_text) or any(w in user_text.lower().split() for w in ("hy", "helo", "hiii", "hey", "hello", "hi")):
+        with st.spinner("AI is thinking..."):
+            reply = mfp.generate_conversational_reply(user_text)
         st.session_state.messages.append({"role": "assistant", "content": reply})
         sync_active_chat()
         return
@@ -1805,12 +1757,9 @@ def handle_user_prompt(prompt):
     if is_cancel_command(prompt):
         if st.session_state.form:
             clear_form_state()
-            reply = (
-                "Current form has been cancelled.\n\n"
-                + build_greeting_reply(list_forms())
-            )
+            reply = "Current form filling was cancelled. Let me know whenever you'd like to fill a form or report an issue."
         else:
-            reply = build_greeting_reply(list_forms())
+            reply = "Let me know whenever you'd like to fill a form or report an issue."
         st.session_state.messages.append({"role": "assistant", "content": reply})
         sync_active_chat()
         return
@@ -1835,15 +1784,18 @@ def handle_user_prompt(prompt):
         return
 
     # Check if user greeted or sent smalltalk mid-form!
-    if is_greeting_or_smalltalk(prompt):
+    if is_greeting_or_smalltalk(prompt) or any(w in prompt.lower().split() for w in ("hy", "helo", "hiii", "hey", "hello", "hi")):
         field_hint = f"{field['label']}"
         if field.get("type") == "select" and field.get("options"):
             field_hint += f" (Options: {', '.join(field['options'])})"
         elif not field.get("required", True):
             field_hint += " (Optional - type 'skip' to leave blank)"
 
+        with st.spinner("AI is thinking..."):
+            conv_reply = mfp.generate_conversational_reply(prompt)
         reply = (
-            f"Hello! We are currently filling {form['form_name']}.\n\n"
+            f"{conv_reply}\n\n"
+            f"We are currently filling {form['form_name']}.\n\n"
             f"Please provide {field_hint} to continue, or type 'cancel' to exit."
         )
         st.session_state.messages.append({"role": "assistant", "content": reply})

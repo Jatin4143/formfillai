@@ -20,10 +20,9 @@ from starlette.routing import Route, Mount
 from starlette.staticfiles import StaticFiles
 import uvicorn
 
+from config import BASE_DIR, FRONTEND_DIR, PORT
 import demo_paragraph as dp
-
-BASE_DIR = Path(__file__).resolve().parent
-FRONTEND_DIR = BASE_DIR / "frontend"
+import multi_form_planner as mfp
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("server")
@@ -286,6 +285,20 @@ async def get_form_schema_endpoint(request):
     return JSONResponse(schema)
 
 
+def is_probable_multi_action(user_text: str) -> bool:
+    """Fast heuristic to check if a message likely contains multiple distinct records/forms."""
+    text_lower = user_text.lower()
+    flats = re.findall(r'\b[a-z]?\s*[-]?\s*\d{3,4}\b', text_lower)
+    if len(flats) >= 2:
+        return True
+    form_kw = sum(1 for kw in ("complaint", "visitor", "notice", "guest") if kw in text_lower)
+    if form_kw >= 2:
+        return True
+    if any(p in text_lower for p in ("two ", "three ", "3 complaints", "2 visitors", "both flats", "multiple")):
+        return True
+    return False
+
+
 def should_switch_to_form(user_text, current_form_key):
     """Check if user wants to switch to a different form without relying on streamlit session_state."""
     detected_key = dp.detect_form_key(user_text)
@@ -313,6 +326,8 @@ async def chat_endpoint(request):
     answers = dict(body.get("answers") or {})
     current_field = body.get("current_field")
     chat_id = body.get("chat_id")
+    actions = list(body.get("actions") or [])
+    is_batch = bool(body.get("is_batch", False))
 
     def make_response(res_data):
         nonlocal chat_id
@@ -348,29 +363,117 @@ async def chat_endpoint(request):
 
     # 2. If no form is currently active
     if not form_key:
-        short_reply = dp.get_short_reply(user_text)
-        if short_reply:
-            return make_response({
-                "status": "idle",
-                "reply": short_reply,
-                "form": None,
-                "form_key": None,
-                "answers": {},
-                "current_field": None,
-                "ready_for_review": False
-            })
+        # Check if user message is purely greeting, pleasantry, or conversational question
+        if dp.is_greeting_or_smalltalk(user_text) or any(w in user_text.lower().split() for w in ("hy", "helo", "hiii", "hey", "hello", "hi")):
+            # Check first if they also gave actual form details (e.g. "hi, flat B-204 tap leak")
+            direct_key = dp.detect_form_key(user_text)
+            if not direct_key and len(user_text.split()) < 12:
+                model_reply = mfp.generate_conversational_reply(user_text)
+                return make_response({
+                    "status": "greeting",
+                    "reply": model_reply,
+                    "form": None,
+                    "form_key": None,
+                    "answers": {},
+                    "current_field": None,
+                    "ready_for_review": False
+                })
 
-        if dp.is_greeting(user_text) or dp.is_greeting_or_smalltalk(user_text):
-            reply = dp.build_greeting_reply(dp.list_forms(), user_text=user_text)
-            return make_response({
-                "status": "greeting",
-                "reply": reply,
-                "form": None,
-                "form_key": None,
-                "answers": {},
-                "current_field": None,
-                "ready_for_review": False
-            })
+        # Fast path: Check if user message directly selects a form from DB (e.g. "add notice", "visitor entry")
+        direct_key = dp.detect_form_key(user_text)
+        if direct_key:
+            form = dp.fetch_form_schema(direct_key)
+            if form and dp.message_is_only_form_name(user_text, form):
+                first_field = form["schema"]["fields"][0] if form["schema"]["fields"] else None
+                question = dp.get_question_for_field(form, first_field) if first_field else ""
+                reply = f"Let's fill out **{form['form_name']}**.\n\n{question}"
+                return make_response({
+                    "status": "in_progress",
+                    "reply": reply,
+                    "form": form,
+                    "form_key": direct_key,
+                    "answers": {},
+                    "current_field": first_field,
+                    "is_batch": False,
+                    "actions": [],
+                    "ready_for_review": False
+                })
+
+        # Check multi-form planner for multi-action batch or paragraph extraction
+        plan = mfp.plan_and_extract(user_text)
+        if plan and plan.get("actions"):
+            if plan["is_multi_action"]:
+                # Multi-record / compound plan (e.g. 3 complaints or visitors + complaint)
+                if plan["all_complete"]:
+                    reply = f"🎉 **Identified and extracted {len(plan['actions'])} items!** Please review and confirm in the pop-up modal."
+                    return make_response({
+                        "status": "ready",
+                        "reply": reply,
+                        "form": None,
+                        "form_key": None,
+                        "answers": {},
+                        "current_field": None,
+                        "is_batch": True,
+                        "actions": plan["actions"],
+                        "ready_for_review": True
+                    })
+                else:
+                    incomplete = [a for a in plan["actions"] if not a["is_complete"]]
+                    first_inc = incomplete[0]
+                    missing_label = first_inc["missing_fields"][0] if first_inc.get("missing_fields") else "required details"
+                    reply = f"I've drafted {len(plan['actions'])} items, but need **{missing_label}** for {first_inc['title']}."
+                    return make_response({
+                        "status": "in_progress",
+                        "reply": reply,
+                        "form": first_inc["schema"],
+                        "form_key": first_inc["form_key"],
+                        "answers": first_inc["fields"],
+                        "current_field": next((f for f in first_inc["schema"]["fields"] if f["label"] == missing_label), None),
+                        "is_batch": True,
+                        "actions": plan["actions"],
+                        "ready_for_review": False
+                    })
+            else:
+                # Single action identified by the planner
+                act = plan["actions"][0]
+                single_form = act["schema"]
+                # Only keep fields that actually have non-null, non-empty values
+                single_answers = {
+                    k: v for k, v in (act.get("fields") or {}).items()
+                    if v is not None and str(v).strip() != "" and str(v).lower() != "null"
+                }
+                if act.get("is_complete") and dp.get_next_field(single_form, single_answers) is None:
+                    reply = f"🎉 **All details have been extracted for {act['form_name']}!** Please review and confirm in the pop-up modal."
+                    return make_response({
+                        "status": "ready",
+                        "reply": reply,
+                        "form": single_form,
+                        "form_key": act["form_key"],
+                        "answers": single_answers,
+                        "current_field": None,
+                        "is_batch": False,
+                        "actions": [act],
+                        "ready_for_review": True
+                    })
+                else:
+                    next_fld = dp.get_next_field(single_form, single_answers)
+                    question = dp.get_question_for_field(single_form, next_fld) if next_fld else ""
+                    if single_answers:
+                        overview_msg = dp.build_form_overview_message(single_form, accepted=single_answers)
+                        reply = f"{overview_msg}\n\n{question}"
+                    else:
+                        reply = f"Let's fill out **{single_form['form_name']}**.\n\n{question}"
+                    return make_response({
+                        "status": "in_progress",
+                        "reply": reply,
+                        "form": single_form,
+                        "form_key": act["form_key"],
+                        "answers": single_answers,
+                        "current_field": next_fld,
+                        "is_batch": False,
+                        "actions": [act],
+                        "ready_for_review": False
+                    })
 
         direct_key = dp.detect_form_key(user_text)
         detected_key = direct_key
@@ -404,11 +507,11 @@ async def chat_endpoint(request):
             more_accepted = dp.apply_extracted_answers(form["schema"], user_text, answers)
             accepted.update(more_accepted)
 
-        overview_msg = dp.build_form_overview_message(form, accepted=accepted)
         next_field = dp.get_next_field(form["schema"], answers)
 
         if next_field is None:
             # All fields collected on first message!
+            overview_msg = dp.build_form_overview_message(form, accepted=accepted)
             reply = f"{overview_msg}\n\n🎉 **All details have been extracted!** Please review and confirm in the pop-up modal."
             return make_response({
                 "status": "ready",
@@ -422,7 +525,11 @@ async def chat_endpoint(request):
             })
         else:
             question = dp.get_question_for_field(form, next_field)
-            reply = f"{overview_msg}\n\n{question}"
+            if accepted:
+                overview_msg = dp.build_form_overview_message(form, accepted=accepted)
+                reply = f"{overview_msg}\n\n{question}"
+            else:
+                reply = f"Let's fill out **{form['form_name']}**.\n\n{question}"
             return make_response({
                 "status": "in_progress",
                 "reply": reply,
@@ -438,6 +545,23 @@ async def chat_endpoint(request):
     form = dp.fetch_form_schema(form_key)
     if not form:
         return JSONResponse({"error": "Active form not found"}, status_code=404)
+
+    # If user provided a batch/compound multi-form request mid-way
+    if is_probable_multi_action(user_text):
+        plan = mfp.plan_and_extract(user_text)
+        if plan and plan.get("is_multi_action"):
+            reply = f"🎉 **Identified and extracted {len(plan['actions'])} items!** Please review and confirm in the pop-up modal."
+            return make_response({
+                "status": "ready" if plan["all_complete"] else "in_progress",
+                "reply": reply,
+                "form": None,
+                "form_key": None,
+                "answers": {},
+                "current_field": None,
+                "is_batch": True,
+                "actions": plan["actions"],
+                "ready_for_review": plan["all_complete"]
+            })
 
     # Check if user wants to switch form mid-way
     switch_key = should_switch_to_form(user_text, form_key)
@@ -475,11 +599,12 @@ async def chat_endpoint(request):
                 "accepted": accepted
             })
 
-    # Mid-form smalltalk check
-    if dp.is_greeting_or_smalltalk(user_text):
+    # Mid-form conversational / smalltalk check
+    if dp.is_greeting_or_smalltalk(user_text) or any(w in user_text.lower().split() for w in ("hy", "helo", "hiii", "hey", "hello", "hi")):
         if not (current_field and not current_field.get("required", True) and user_text.strip().lower() in ("no", "none", "skip", "na", "n/a", "nil")):
             label = current_field["label"] if current_field else "the next field"
-            reply = f"Hello! We are currently filling out **{form['form_name']}**.\n\nPlease share {label.lower()} to continue, or type 'cancel' to exit."
+            conv_reply = mfp.generate_conversational_reply(user_text)
+            reply = f"{conv_reply}\n\nWe are currently filling out **{form['form_name']}** — please provide {label.lower()} to continue, or type 'cancel' to exit."
             return make_response({
                 "status": "in_progress",
                 "reply": reply,
@@ -490,17 +615,32 @@ async def chat_endpoint(request):
                 "ready_for_review": False
             })
 
-    # Handle field collection: first extract any fields from the message
-    accepted = dp.apply_extracted_answers(form["schema"], user_text, answers)
+    # Handle field collection
+    accepted = {}
+    direct_match = False
+    f_name = current_field.get("name") if (current_field and isinstance(current_field, dict)) else None
+    is_field_unanswered = bool(
+        f_name
+        and (f_name not in answers or answers[f_name] is None or str(answers[f_name]).strip() == "" or str(answers[f_name]).lower() == "null")
+    )
 
-    # If the current field was not populated by extraction, test if user_text directly answers it
-    if current_field and current_field["name"] not in answers:
+    # 1. If currently waiting for a specific field, test direct validation first
+    if is_field_unanswered:
         ok, val = dp.validate_answer(current_field, user_text)
         if ok:
-            answers[current_field["name"]] = val
-            accepted[current_field["name"]] = val
-        elif not accepted:
-            # Failed validation and nothing else was extracted
+            answers[f_name] = val
+            accepted[f_name] = val
+            direct_match = True
+
+    # 2. If the user provided a compound message that might contain other fields as well (not just answering current_field)
+    if not direct_match or (any(c in user_text for c in (",", "\n", ";")) or " and " in user_text.lower()):
+        extracted = dp.apply_extracted_answers(form["schema"], user_text, answers)
+        accepted.update(extracted)
+
+    # 3. If neither direct validation nor extraction succeeded for the current field
+    if is_field_unanswered and (f_name not in answers or answers[f_name] is None or str(answers[f_name]).strip() == ""):
+        ok, val = dp.validate_answer(current_field, user_text)
+        if not ok and not accepted:
             return make_response({
                 "status": "validation_error",
                 "reply": val,
@@ -508,10 +648,70 @@ async def chat_endpoint(request):
                 "form_key": form_key,
                 "answers": answers,
                 "current_field": current_field,
+                "is_batch": is_batch,
+                "actions": actions,
                 "ready_for_review": False
             })
 
-    # Check next missing field
+    # 4. If this is an active batch session, sync newly answered field into the actions basket!
+    if is_batch and actions:
+        target_act = None
+        for act in actions:
+            if act.get("form_key") == form_key and not act.get("is_complete"):
+                target_act = act
+                break
+        if not target_act:
+            for act in actions:
+                if act.get("form_key") == form_key:
+                    target_act = act
+                    break
+
+        if target_act:
+            target_act.setdefault("fields", {}).update({
+                k: v for k, v in answers.items() if v is not None and str(v).strip() != "" and str(v).lower() != "null"
+            })
+            missing = []
+            for fld in target_act["schema"]["fields"]:
+                if fld.get("required", True):
+                    fval = target_act["fields"].get(fld["name"])
+                    if fval is None or str(fval).strip() == "" or str(fval).lower() == "null":
+                        missing.append(fld["label"])
+            target_act["missing_fields"] = missing
+            target_act["is_complete"] = len(missing) == 0
+
+        # Check if ALL actions in the batch are now complete
+        incomplete = [a for a in actions if not a.get("is_complete")]
+        if not incomplete:
+            reply = f"🎉 **All details complete for all {len(actions)} forms!** Please review and confirm in the pop-up modal."
+            return make_response({
+                "status": "ready",
+                "reply": reply,
+                "form": None,
+                "form_key": None,
+                "answers": {},
+                "current_field": None,
+                "is_batch": True,
+                "actions": actions,
+                "ready_for_review": True
+            })
+        else:
+            first_inc = incomplete[0]
+            missing_label = first_inc["missing_fields"][0] if first_inc.get("missing_fields") else "required details"
+            next_fld = next((f for f in first_inc["schema"]["fields"] if f["label"] == missing_label), None)
+            reply = f"Saved {current_field['label'] if current_field else 'answer'}. Next, please provide **{missing_label}** for {first_inc['title']}."
+            return make_response({
+                "status": "in_progress",
+                "reply": reply,
+                "form": first_inc["schema"],
+                "form_key": first_inc["form_key"],
+                "answers": first_inc["fields"],
+                "current_field": next_fld,
+                "is_batch": True,
+                "actions": actions,
+                "ready_for_review": False
+            })
+
+    # Check next missing field (for standalone single form)
     next_field = dp.get_next_field(form["schema"], answers)
     msg_prefix = ""
     if len(accepted) > 1:
@@ -526,6 +726,8 @@ async def chat_endpoint(request):
             "form_key": form_key,
             "answers": answers,
             "current_field": None,
+            "is_batch": False,
+            "actions": [],
             "ready_for_review": True,
             "accepted": accepted
         })
@@ -539,6 +741,8 @@ async def chat_endpoint(request):
         "form_key": form_key,
         "answers": answers,
         "current_field": next_field,
+        "is_batch": False,
+        "actions": [],
         "ready_for_review": False,
         "accepted": accepted
     })
@@ -589,6 +793,22 @@ async def submit_form_endpoint(request):
     })
 
 
+async def submit_batch_endpoint(request):
+    """
+    POST /api/forms/submit-batch
+    Submits multiple form records in a single atomic transaction.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    items = body.get("items") or []
+    chat_id = body.get("chat_id")
+    result = mfp.execute_batch_submission(items, chat_id=chat_id)
+    return JSONResponse(result)
+
+
 async def list_submissions_endpoint(request):
     """GET /api/submissions - returns recent submissions from database."""
     conn = dp.get_connection()
@@ -627,6 +847,7 @@ routes = [
     Route("/api/chats/{id}", delete_chat_endpoint, methods=["DELETE"]),
     Route("/api/chat", chat_endpoint, methods=["POST"]),
     Route("/api/forms/{key}/submit", submit_form_endpoint, methods=["POST"]),
+    Route("/api/forms/submit-batch", submit_batch_endpoint, methods=["POST"]),
     Route("/api/submissions", list_submissions_endpoint, methods=["GET"]),
     Mount("/", app=StaticFiles(directory=str(FRONTEND_DIR), html=True)),
 ]
@@ -644,7 +865,6 @@ middleware = [
 app = Starlette(debug=True, routes=routes, middleware=middleware)
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8000"))
-    log.info("Starting FieldFlow API Server on http://0.0.0.0:%s", port)
-    uvicorn.run("server:app", host="0.0.0.0", port=port, reload=True)
+    log.info("Starting FieldFlow API Server on http://0.0.0.0:%s", PORT)
+    uvicorn.run("server:app", host="0.0.0.0", port=PORT, reload=True)
 

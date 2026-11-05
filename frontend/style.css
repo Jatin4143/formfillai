@@ -1622,3 +1622,66 @@ textarea.modal-input {
     max-height: 95vh;
   }
 }
+
+/* ======================================================== */
+/* Multi-Record & Batch Form Review Modal Styles           */
+/* ======================================================== */
+.modal-dialog-batch {
+  max-width: 720px;
+}
+
+.modal-batch-card {
+  background: var(--bg-surface-elevated, #f8fafc);
+  border: 1px solid var(--border-subtle, #e2e8f0);
+  border-radius: var(--radius-md, 8px);
+  padding: 1.1rem;
+  margin-bottom: 1.1rem;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.04);
+}
+
+.batch-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.85rem;
+  padding-bottom: 0.55rem;
+  border-bottom: 1px solid var(--border-subtle, #e2e8f0);
+}
+
+.batch-card-title {
+  font-weight: 700;
+  font-size: 0.95rem;
+  color: var(--text-main, #0f172a);
+}
+
+.batch-card-tag {
+  font-size: 0.72rem;
+  font-weight: 600;
+  padding: 0.2rem 0.55rem;
+  border-radius: var(--radius-full, 9999px);
+  background: rgba(59, 130, 246, 0.1);
+  color: #2563eb;
+}
+
+.batch-receipt-item {
+  background: rgba(255, 255, 255, 0.7);
+  border: 1px solid rgba(16, 185, 129, 0.2);
+  border-radius: 6px;
+  padding: 0.65rem 0.85rem;
+  margin-top: 0.5rem;
+}
+
+.batch-receipt-item-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.35rem;
+  font-weight: 600;
+  font-size: 0.85rem;
+}
+
+.receipt-sub-name {
+  color: #047857;
+  font-weight: 700;
+}
+

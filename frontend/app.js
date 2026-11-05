@@ -14,6 +14,10 @@
   let currentField = null;
   let isWaiting = false;
 
+  // --- Multi-Action / Batch State ---
+  let activeActions = [];
+  let isBatchMode = false;
+
   // --- Chat History State ---
   let chats = [];
   let activeChatId = null;
@@ -51,6 +55,7 @@
 
   // Review Modal
   const modalBackdrop = document.getElementById('modal-backdrop');
+  const reviewModal = document.getElementById('review-modal');
   const modalTitle = document.getElementById('modal-title');
   const modalFormBadge = document.getElementById('modal-form-badge');
   const modalEditForm = document.getElementById('modal-edit-form');
@@ -125,10 +130,12 @@
 
     // Review Modal Open Buttons
     btnOpenReview.addEventListener('click', () => {
-      if (activeForm) openReviewModal(activeForm, answers);
+      if (isBatchMode && activeActions.length) openBatchReviewModal(activeActions);
+      else if (activeForm) openReviewModal(activeForm, answers);
     });
     btnHeaderReview.addEventListener('click', () => {
-      if (activeForm) openReviewModal(activeForm, answers);
+      if (isBatchMode && activeActions.length) openBatchReviewModal(activeActions);
+      else if (activeForm) openReviewModal(activeForm, answers);
     });
 
     // Review Modal Close Buttons
@@ -256,6 +263,8 @@
         answers: answers,
         current_field: currentField,
         chat_id: activeChatId,
+        actions: activeActions,
+        is_batch: isBatchMode,
       };
 
       const res = await fetch('/api/chat', {
@@ -301,11 +310,21 @@
       renderChatsList();
     }
 
+    if (data.actions && data.actions.length > 0) {
+      activeActions = data.actions;
+      isBatchMode = Boolean(data.is_batch) || activeActions.length > 1;
+    } else {
+      activeActions = [];
+      isBatchMode = false;
+    }
+
     if (data.status === 'cancelled') {
       activeFormKey = null;
       activeForm = null;
       answers = {};
       currentField = null;
+      activeActions = [];
+      isBatchMode = false;
       updateActiveFormUI();
       appendMessage('assistant', data.reply);
       updateSuggestions([]);
@@ -334,10 +353,13 @@
     // When all fields are collected (data.ready_for_review === true),
     // automatically open the Review & Edit Modal!
     // ========================================================
-    if (data.ready_for_review && activeForm) {
-      // Smooth auto-open after short animation delay
+    if (data.ready_for_review) {
       setTimeout(() => {
-        openReviewModal(activeForm, answers);
+        if (isBatchMode && activeActions.length > 0) {
+          openBatchReviewModal(activeActions);
+        } else if (activeForm) {
+          openReviewModal(activeForm, answers);
+        }
       }, 400);
     }
   }
@@ -369,6 +391,44 @@
     const card = document.createElement('div');
     card.className = 'receipt-card';
     
+    if (data.is_multi && data.records) {
+      let itemsHtml = '';
+      data.records.forEach((rec) => {
+        let fieldsHtml = '';
+        for (const [k, v] of Object.entries(rec.answers || {})) {
+          if (v) {
+            fieldsHtml += `
+              <div class="receipt-field-item">
+                <span>${escapeHtml(k.replace(/_/g, ' '))}</span>
+                <strong>${escapeHtml(v)}</strong>
+              </div>
+            `;
+          }
+        }
+        itemsHtml += `
+          <div class="batch-receipt-item">
+            <div class="batch-receipt-item-top">
+              <span class="receipt-sub-name">${escapeHtml(rec.form_name)}</span>
+              <span class="receipt-badge">#${rec.submission_id}</span>
+            </div>
+            <div class="receipt-fields">
+              ${fieldsHtml}
+            </div>
+          </div>
+        `;
+      });
+
+      card.innerHTML = `
+        <div class="receipt-header">
+          <strong style="color:#10b981;">✓ All ${data.records.length} Submissions Successful</strong>
+        </div>
+        <div class="batch-receipt-list">
+          ${itemsHtml}
+        </div>
+      `;
+      return card;
+    }
+
     let fieldsHtml = '';
     for (const [k, v] of Object.entries(data.answers || {})) {
       fieldsHtml += `
@@ -504,9 +564,12 @@
   // REVIEW & EDIT MODAL (Pop-up Dialog Logic)
   // ========================================================
   function openReviewModal(form, currentAnswers) {
+    if (reviewModal) reviewModal.classList.remove('modal-dialog-batch');
     modalTitle.textContent = `Review & Confirm Form`;
     modalFormBadge.textContent = form.form_name;
     modalEditForm.innerHTML = '';
+    const submitSpan = btnModalSubmit.querySelector('span');
+    if (submitSpan) submitSpan.textContent = 'Confirm & Submit';
 
     const fields = form.schema ? form.schema.fields : [];
     fields.forEach((field) => {
@@ -580,11 +643,185 @@
     if (firstInput) setTimeout(() => firstInput.focus(), 150);
   }
 
+  function openBatchReviewModal(actions) {
+    if (reviewModal) reviewModal.classList.add('modal-dialog-batch');
+    modalTitle.textContent = `Review & Confirm (${actions.length} Items)`;
+    modalFormBadge.textContent = 'Multi-Record Batch';
+    modalEditForm.innerHTML = '';
+    const submitSpan = btnModalSubmit.querySelector('span');
+    if (submitSpan) submitSpan.textContent = `Confirm & Submit All (${actions.length} Records)`;
+
+    actions.forEach((act, idx) => {
+      const card = document.createElement('div');
+      card.className = 'modal-batch-card';
+      card.dataset.actionIndex = idx;
+      card.dataset.formKey = act.form_key;
+
+      const header = document.createElement('div');
+      header.className = 'batch-card-header';
+      header.innerHTML = `
+        <span class="batch-card-title">${escapeHtml(act.title || act.form_name)}</span>
+        <span class="batch-card-tag">${escapeHtml(act.form_name)}</span>
+      `;
+      card.appendChild(header);
+
+      const fields = act.schema ? act.schema.fields : [];
+      fields.forEach((field) => {
+        const fieldCard = document.createElement('div');
+        fieldCard.className = 'modal-field-card';
+
+        const labelRow = document.createElement('div');
+        labelRow.className = 'modal-field-label-row';
+
+        const label = document.createElement('label');
+        label.className = 'modal-field-label';
+        label.textContent = field.label;
+
+        const badge = document.createElement('span');
+        badge.className = `modal-field-badge ${field.required ? 'required' : 'optional'}`;
+        badge.textContent = field.required ? 'Required' : 'Optional';
+
+        labelRow.appendChild(label);
+        labelRow.appendChild(badge);
+        fieldCard.appendChild(labelRow);
+
+        const val = act.fields && act.fields[field.name] != null ? act.fields[field.name] : '';
+
+        if (field.type === 'select' && field.options && field.options.length) {
+          const select = document.createElement('select');
+          select.className = 'modal-input';
+          select.dataset.fieldName = field.name;
+
+          if (!field.required) {
+            const opt = document.createElement('option');
+            opt.value = '';
+            opt.textContent = '-- None (Skip) --';
+            select.appendChild(opt);
+          }
+
+          field.options.forEach((optText) => {
+            const opt = document.createElement('option');
+            opt.value = optText;
+            opt.textContent = optText;
+            if (val === optText) opt.selected = true;
+            select.appendChild(opt);
+          });
+          fieldCard.appendChild(select);
+        } else if (field.type === 'textarea') {
+          const textarea = document.createElement('textarea');
+          textarea.className = 'modal-input';
+          textarea.dataset.fieldName = field.name;
+          textarea.rows = 2;
+          textarea.value = val;
+          fieldCard.appendChild(textarea);
+        } else {
+          const input = document.createElement('input');
+          input.type = 'text';
+          input.className = 'modal-input';
+          input.dataset.fieldName = field.name;
+          input.value = val;
+          fieldCard.appendChild(input);
+        }
+
+        card.appendChild(fieldCard);
+      });
+
+      modalEditForm.appendChild(card);
+    });
+
+    modalBackdrop.style.display = 'flex';
+    const firstInput = modalEditForm.querySelector('input, select, textarea');
+    if (firstInput) setTimeout(() => firstInput.focus(), 150);
+  }
+
   function closeReviewModal() {
     modalBackdrop.style.display = 'none';
+    if (reviewModal) reviewModal.classList.remove('modal-dialog-batch');
   }
 
   async function submitReviewedForm() {
+    if (isBatchMode && activeActions.length > 0) {
+      const items = [];
+      let hasValidationError = false;
+
+      activeActions.forEach((act, idx) => {
+        if (hasValidationError) return;
+        const card = modalEditForm.querySelector(`[data-action-index="${idx}"]`);
+        if (!card) return;
+
+        const cardAnswers = {};
+        const fields = act.schema ? act.schema.fields : [];
+
+        for (const f of fields) {
+          const input = card.querySelector(`[data-field-name="${f.name}"]`);
+          let val = input ? input.value.trim() : '';
+          if (f.required && !val) {
+            showToast(`Please provide "${f.label}" for ${act.title || act.form_name}`, 'error');
+            if (input) input.focus();
+            hasValidationError = true;
+            return;
+          }
+          cardAnswers[f.name] = val || null;
+        }
+
+        items.push({
+          form_key: act.form_key,
+          answers: cardAnswers
+        });
+      });
+
+      if (hasValidationError) return;
+
+      btnModalSubmit.disabled = true;
+      btnModalSubmit.innerHTML = `
+        <svg class="pulse-dot" width="16" height="16" style="margin-right:6px;"></svg>
+        Submitting All...
+      `;
+
+      try {
+        const res = await fetch('/api/forms/submit-batch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ items, chat_id: activeChatId }),
+        });
+
+        if (!res.ok) throw new Error('Batch submission failed');
+        const data = await res.json();
+        if (!data.success) throw new Error(data.error || 'Submission failed');
+
+        closeReviewModal();
+        showToast(`All ${data.count} records submitted successfully!`, 'success');
+
+        appendMessage('assistant', `All set! **${data.count} submissions** recorded successfully:`, {
+          is_multi: true,
+          records: data.records
+        });
+
+        // Reset state
+        activeActions = [];
+        isBatchMode = false;
+        activeFormKey = null;
+        activeForm = null;
+        answers = {};
+        currentField = null;
+        updateActiveFormUI();
+        renderFormsCatalog();
+        updateSuggestions([]);
+      } catch (err) {
+        console.error('Batch submit error:', err);
+        showToast(`Error: ${err.message}`, 'error');
+      } finally {
+        btnModalSubmit.disabled = false;
+        btnModalSubmit.innerHTML = `
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+            <polyline points="20 6 9 17 4 12"></polyline>
+          </svg>
+          <span>Confirm & Submit</span>
+        `;
+      }
+      return;
+    }
+
     if (!activeFormKey || !activeForm) return;
 
     // Gather values from modal form
@@ -853,6 +1090,8 @@
     activeForm = null;
     answers = {};
     currentField = null;
+    activeActions = [];
+    isBatchMode = false;
 
     updateActiveFormUI();
     renderFormsCatalog();
@@ -885,6 +1124,8 @@
       activeForm = chat.form || null;
       answers = chat.answers || {};
       currentField = chat.current_field || null;
+      activeActions = [];
+      isBatchMode = false;
 
       chatMessages.innerHTML = '';
       const msgs = chat.messages || [];
