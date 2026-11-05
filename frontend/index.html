@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FieldFlow AI — Conversational Form Filling</title>
+  <meta name="description" content="Intelligent conversational form filling powered by AI with interactive review modal.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css?v=history-v5">
+</head>
+<body>
+  <div class="app-layout">
+    <!-- Left Sidebar -->
+    <aside class="sidebar" id="sidebar">
+      <div class="brand-header">
+        <div class="brand-logo">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+            <polyline points="14 2 14 8 20 8"></polyline>
+            <path d="m9 15 2 2 4-4"></path>
+          </svg>
+        </div>
+        <div class="brand-info">
+          <h1 class="brand-title">FieldFlow AI</h1>
+          <span class="brand-badge"><span class="pulse-dot"></span> Ollama Active</span>
+        </div>
+      </div>
+
+      <button id="btn-new-chat" class="btn btn-primary btn-new-chat">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="12" y1="5" x2="12" y2="19"></line>
+          <line x1="5" y1="12" x2="19" y2="12"></line>
+        </svg>
+        New Conversation
+      </button>
+
+      <!-- Available Forms Dropdown (Upper Side) -->
+      <div class="sidebar-section forms-dropdown-section">
+        <div class="section-label">Available Forms</div>
+        <div class="form-dropdown-wrapper">
+          <select id="forms-select" class="form-select-input" aria-label="Select a form to fill">
+            <option value="" disabled selected>▾ Choose a form to fill...</option>
+          </select>
+          <div class="dropdown-arrow">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="6 9 12 15 18 9"></polyline>
+            </svg>
+          </div>
+        </div>
+      </div>
+
+      <!-- Active Form Card (Hidden when no form selected) -->
+      <div class="sidebar-section active-form-section" id="active-form-card" style="display: none;">
+        <div class="section-label">Active Form</div>
+        <div class="active-form-box">
+          <div class="active-form-header">
+            <h3 id="active-form-name">Visitor Entry</h3>
+            <span class="status-tag" id="active-form-tag">In Progress</span>
+          </div>
+
+          <div class="progress-bar-wrapper">
+            <div class="progress-bar-fill" id="active-form-progress" style="width: 0%;"></div>
+          </div>
+          <div class="progress-text">
+            <span id="active-form-counts">0 / 0 fields</span>
+            <span id="active-form-percent">0%</span>
+          </div>
+
+          <ul class="field-checklist" id="active-form-checklist">
+            <!-- Dynamic items -->
+          </ul>
+
+          <button id="btn-open-review" class="btn btn-review-trigger">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
+              <circle cx="12" cy="12" r="3"></circle>
+            </svg>
+            Review & Edit in Modal
+          </button>
+        </div>
+      </div>
+
+      <!-- Chat History Section (All History) -->
+      <div class="sidebar-section chats-section">
+        <div class="section-label">All History</div>
+        <div class="chats-list" id="chats-list">
+          <!-- Populated by JS -->
+        </div>
+      </div>
+
+      <!-- History & Submissions -->
+      <div class="sidebar-footer">
+        <button id="btn-view-submissions" class="btn btn-ghost footer-link">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+            <polyline points="14 2 14 8 20 8"></polyline>
+            <line x1="16" y1="13" x2="8" y2="13"></line>
+            <line x1="16" y1="17" x2="8" y2="17"></line>
+            <polyline points="10 9 9 9 8 9"></polyline>
+          </svg>
+          View Submitted Records
+        </button>
+      </div>
+    </aside>
+
+    <!-- Main Chat Workspace -->
+    <main class="main-content">
+      <!-- Top Bar -->
+      <header class="top-bar">
+        <button id="btn-toggle-sidebar" class="btn-icon mobile-only" aria-label="Toggle Menu">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="3" y1="12" x2="21" y2="12"></line>
+            <line x1="3" y1="6" x2="21" y2="6"></line>
+            <line x1="3" y1="18" x2="21" y2="18"></line>
+          </svg>
+        </button>
+        <div class="top-bar-title">
+          <span class="topic-indicator" id="current-form-indicator">Assistant</span>
+          <span class="topic-sub" id="current-field-indicator">Ready to help</span>
+        </div>
+        <div class="top-bar-actions">
+          <button id="btn-header-review" class="btn btn-outline" style="display: none;">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+              <line x1="9" y1="9" x2="15" y2="9"></line>
+              <line x1="9" y1="13" x2="15" y2="13"></line>
+              <line x1="9" y1="17" x2="11" y2="17"></line>
+            </svg>
+            Review Fields
+          </button>
+        </div>
+      </header>
+
+      <!-- Messages Thread -->
+      <div class="chat-container" id="chat-container">
+        <div class="chat-messages" id="chat-messages">
+          <!-- Welcome Hero View (Displayed on fresh start) -->
+          <div class="welcome-card" id="welcome-card">
+            <div class="welcome-icon">💬</div>
+            <h2>Conversational Form Assistant</h2>
+            <p>Paste a whole paragraph with your details, or chat naturally one question at a time. When all fields are collected, an editable review modal pops up!</p>
+            
+            <div class="quick-samples">
+              <div class="sample-label">Try clicking an example to paste:</div>
+              <div class="sample-chips">
+                <button class="chip" data-sample="Visitor Rahul Sharma coming to flat 302 for delivery in vehicle MH12AB1234">
+                  🚗 Visitor Entry (Full paragraph)
+                </button>
+                <button class="chip" data-sample="Raise complaint for water pipe leakage in flat B-104 with High urgency">
+                  🚰 Raise Complaint (Quick issue)
+                </button>
+                <button class="chip" data-sample="Add notice for All Wings regarding Society AGM this Sunday at 10 AM">
+                  📢 Add Notice (Announcement)
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Typing Indicator -->
+        <div class="typing-indicator" id="typing-indicator" style="display: none;">
+          <div class="typing-avatar">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M12 2a10 10 0 1 0 10 10H12V2z"></path>
+            </svg>
+          </div>
+          <div class="typing-bubble">
+            <span class="dot"></span>
+            <span class="dot"></span>
+            <span class="dot"></span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Quick Chips Bar (Suggestions based on state) -->
+      <div class="suggestions-bar" id="suggestions-bar"></div>
+
+      <!-- Chat Input Area -->
+      <footer class="chat-input-area">
+        <form class="input-form" id="chat-form">
+          <textarea 
+            id="chat-input" 
+            placeholder="Type your answer, or paste full details here..." 
+            rows="1"
+            autocomplete="off"
+            autofocus
+          ></textarea>
+          <button type="submit" id="btn-send" class="btn btn-send" aria-label="Send message">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="22" y1="2" x2="11" y2="13"></line>
+              <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+            </svg>
+          </button>
+        </form>
+        <div class="input-hints">
+          <span>Press <strong>Enter</strong> to send, <strong>Shift + Enter</strong> for new line.</span>
+          <span class="sub-hint">Type <strong>cancel</strong> to reset current form.</span>
+        </div>
+      </footer>
+    </main>
+  </div>
+
+  <!-- ======================================================== -->
+  <!-- REVIEW & EDIT MODAL (Pop-up Dialog when all fields collected) -->
+  <!-- ======================================================== -->
+  <div class="modal-backdrop" id="modal-backdrop" style="display: none;">
+    <div class="modal-dialog" id="review-modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <div class="modal-header">
+        <div class="modal-title-group">
+          <div class="modal-icon">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+              <path d="M9 11l3 3L22 4"></path>
+              <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"></path>
+            </svg>
+          </div>
+          <div>
+            <h2 class="modal-title" id="modal-title">Review & Confirm Form</h2>
+            <p class="modal-subtitle">All questions answered! Review or adjust values below before submitting.</p>
+          </div>
+        </div>
+        <button type="button" class="btn-close" id="btn-close-modal" aria-label="Close dialog">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="6" x2="6" y2="18"></line>
+            <line x1="6" y1="6" x2="18" y2="18"></line>
+          </svg>
+        </button>
+      </div>
+
+      <div class="modal-body">
+        <div class="modal-form-badge" id="modal-form-badge">Visitor Entry</div>
+
+        <!-- Form fields container where all Q&A are rendered as inputs -->
+        <form id="modal-edit-form" class="modal-fields-list">
+          <!-- Populated dynamically by app.js -->
+        </form>
+      </div>
+
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" id="btn-modal-cancel">
+          Continue Chatting
+        </button>
+        <button type="button" class="btn btn-primary btn-submit" id="btn-modal-submit">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+            <polyline points="20 6 9 17 4 12"></polyline>
+          </svg>
+          <span>Confirm & Submit</span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ======================================================== -->
+  <!-- SUBMISSIONS DRAWER MODAL -->
+  <!-- ======================================================== -->
+  <div class="modal-backdrop" id="submissions-backdrop" style="display: none;">
+    <div class="modal-dialog modal-dialog-lg" role="dialog" aria-modal="true">
+      <div class="modal-header">
+        <div class="modal-title-group">
+          <div class="modal-icon">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+              <polyline points="14 2 14 8 20 8"></polyline>
+            </svg>
+          </div>
+          <div>
+            <h2 class="modal-title">Database Submissions</h2>
+            <p class="modal-subtitle">Previously saved form records stored in SQLite</p>
+          </div>
+        </div>
+        <button type="button" class="btn-close" id="btn-close-submissions">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="6" x2="6" y2="18"></line>
+            <line x1="6" y1="6" x2="18" y2="18"></line>
+          </svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div class="submissions-list" id="submissions-container">
+          <!-- Populated by JS -->
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ======================================================== -->
+  <!-- DELETE CONVERSATION CONFIRMATION MODAL -->
+  <!-- ======================================================== -->
+  <div class="modal-backdrop" id="delete-modal-backdrop" style="display: none;">
+    <div class="modal-dialog modal-dialog-confirm" role="dialog" aria-modal="true" aria-labelledby="delete-dialog-title">
+      <div class="modal-header modal-header-confirm">
+        <div class="modal-title-group">
+          <div class="modal-icon modal-icon-danger">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="3 6 5 6 21 6"></polyline>
+              <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+              <line x1="10" y1="11" x2="10" y2="17"></line>
+              <line x1="14" y1="11" x2="14" y2="17"></line>
+            </svg>
+          </div>
+          <div>
+            <h2 class="modal-title" id="delete-dialog-title">Delete Conversation</h2>
+            <p class="modal-subtitle">This action cannot be undone</p>
+          </div>
+        </div>
+        <button type="button" class="btn-close" id="btn-close-delete-modal" aria-label="Close dialog">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="6" x2="6" y2="18"></line>
+            <line x1="6" y1="6" x2="18" y2="18"></line>
+          </svg>
+        </button>
+      </div>
+
+      <div class="modal-body modal-body-confirm">
+        <p class="confirm-message">
+          Are you sure you want to delete <span class="confirm-chat-name" id="delete-chat-name">this conversation</span>?
+        </p>
+        <p class="confirm-submessage">
+          This chat session and its recorded answers will be permanently removed from your history.
+        </p>
+      </div>
+
+      <div class="modal-footer modal-footer-confirm">
+        <button type="button" class="btn btn-secondary" id="btn-cancel-delete">
+          Cancel
+        </button>
+        <button type="button" class="btn btn-danger" id="btn-confirm-delete">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="3 6 5 6 21 6"></polyline>
+            <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+          </svg>
+          <span>Delete Conversation</span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast Notification Container -->
+  <div class="toast-container" id="toast-container"></div>
+
+  <script src="app.js?v=history-v5"></script>
+</body>
+</html>
