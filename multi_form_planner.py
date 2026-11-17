@@ -83,81 +83,32 @@ def get_form_by_key(form_key: str, catalog=None):
     return None
 
 
-PLANNER_SYSTEM_PROMPT = """You are an intelligent form planner and multi-action data extractor.
-You are given a catalog of available forms (each with a key, form name, and list of fields) and a user's message.
+PLANNER_SYSTEM_PROMPT = """You are an intelligent, schema-driven multi-form planner and data extractor.
+You analyze the user's message against the available forms catalog and output a clean JSON action plan.
 
-Your instructions:
-1. Analyze the user's message. Determine whether it describes:
-   - A single form request (1 action)
-   - Multiple records of the SAME form (batch, e.g. separate complaints for different flats)
-   - Multiple records of DIFFERENT forms (compound, e.g. visitor entries + complaint)
-2. If different flats or units are mentioned for different problems, assign the respective flat number to that specific action.
-3. If an ambient resident name or flat applies to ALL actions, place it in "shared_context".
-4. For each distinct action or record:
-   - Identify the matching "form_key" from the catalog.
-   - Give it a brief "title" (e.g. "Complaint Flat B-204", "Visitor Entry - Car").
-   - Extract the specific field values for that action.
-   - For category/select fields: pick the best matching option from the options list.
-   - For textarea/details fields: put the specific issue/description for that item (not the whole prompt).
-   - If a field is not stated or unknown, set its value to null. Never invent details.
-5. Return ONLY a valid JSON object.
+CRITICAL RULES:
+1. ONLY EXTRACT WHAT THE USER MENTIONED:
+   - Extract ONLY the specific items described in the User Message.
+   - NEVER create actions for forms that the user did not ask for.
+   - NEVER invent, hallucinate, or output dummy records, fake names, or fake flat numbers.
+   - If the user reports 2 maintenance issues, output EXACTLY 2 actions with form_key: "raise_complaint". Do NOT create visitor entries or notices.
 
-Examples:
+2. ONE ACTION PER DISTINCT ISSUE:
+   - Separate issues or units into distinct actions (e.g. Flat 101 sink leak, Flat 102 elevator buttons).
 
-User: "There are two complaints: Flat 101 has tap leakage, and flat 102 has elevator light broken"
+3. SCHEMA-GROUNDED OPTIONS:
+   - For fields with "options" (e.g. category, purpose): select the best matching option from the schema's options list.
+
+Output Schema:
 {
-  "is_multi_action": true,
+  "is_multi_action": true/false,
   "shared_context": {},
   "actions": [
     {
-      "form_key": "raise_complaint",
-      "title": "Tap Leakage (Flat 101)",
+      "form_key": "<exact key from catalog>",
+      "title": "<short descriptive title>",
       "fields": {
-        "category": "Water",
-        "flat_number": "101",
-        "details": "Tap leakage in flat 101",
-        "urgency": "Medium"
-      }
-    },
-    {
-      "form_key": "raise_complaint",
-      "title": "Elevator Light Broken (Flat 102)",
-      "fields": {
-        "category": "Electricity",
-        "flat_number": "102",
-        "details": "Elevator light broken for flat 102",
-        "urgency": "Medium"
-      }
-    }
-  ]
-}
-
-User: "My name is Priya from flat A-301. Guest Amit coming by car MH12AB1234, and also complaint about low water pressure"
-{
-  "is_multi_action": true,
-  "shared_context": {
-    "flat_number": "A-301",
-    "resident_name": "Priya"
-  },
-  "actions": [
-    {
-      "form_key": "visitor_entry",
-      "title": "Guest Amit (Car MH12AB1234)",
-      "fields": {
-        "visitor_name": "Amit",
-        "flat_number": "A-301",
-        "purpose": "Guest",
-        "vehicle_number": "MH12AB1234"
-      }
-    },
-    {
-      "form_key": "raise_complaint",
-      "title": "Low Water Pressure",
-      "fields": {
-        "category": "Water",
-        "flat_number": "A-301",
-        "details": "Low water pressure in flat A-301",
-        "urgency": "Medium"
+        "<field_name>": "<value_or_null>"
       }
     }
   ]
@@ -206,9 +157,67 @@ def _normalize_select_value(raw_val, options):
     return raw_val
 
 
+def is_grounded_in_user_text(act, user_text: str) -> bool:
+    """
+    Strict anti-hallucination guardrail:
+    Filters out any dummy/example actions hallucinated by small models
+    (such as fake visitors, dummy notices, or unmentioned flats/issues).
+    """
+    if not user_text or not user_text.strip():
+        return True
+
+    text_lower = user_text.lower()
+    form_key = act.get("form_key")
+    raw_fields = act.get("fields") or {}
+
+    # 1. Intent check for specific form domains
+    if form_key == "visitor_entry":
+        if not any(w in text_lower for w in ("visitor", "guest", "delivery", "vehicle", "car", "bike", "cab", "courier", "swiggy", "zomato", "uber", "visit", "arriving", "arrive")):
+            return False
+
+    if form_key == "add_notice":
+        if not any(w in text_lower for w in ("notice", "announcement", "circular", "broadcast", "post a notice")):
+            return False
+
+    user_words = set(re.findall(r'\b[a-zA-Z0-9]{2,}\b', text_lower))
+
+    # 2. Check identifying entity details (flat number, visitor name, vehicle number)
+    specific_identifiers = [
+        str(raw_fields.get("visitor_name") or ""),
+        str(raw_fields.get("flat_number") or ""),
+        str(raw_fields.get("vehicle_number") or ""),
+    ]
+    specific_str = " ".join(specific_identifiers).strip()
+    if specific_str:
+        specific_words = [
+            w.lower() for w in re.findall(r'\b[a-zA-Z0-9]{2,}\b', specific_str)
+            if w.lower() not in ("flat", "wing", "room", "number", "all", "none", "null")
+        ]
+        if specific_words and not any(w in user_words for w in specific_words):
+            return False
+
+    # 3. Check details/description text overlap
+    details_str = str(raw_fields.get("details") or raw_fields.get("description") or act.get("title") or "")
+    details_words = [
+        w.lower() for w in re.findall(r'\b[a-zA-Z0-9]{3,}\b', details_str)
+        if w.lower() not in ("flat", "wing", "room", "number", "issue", "issues", "maintenance", "reported", "report", "complaint", "other")
+    ]
+    if details_words:
+        overlap = sum(1 for w in details_words if w in user_words)
+        if overlap == 0:
+            return False
+
+    return True
+
+
 def apply_shared_context_and_validate(plan_result, catalog, user_text=""):
     shared = plan_result.get("shared_context") or {}
-    actions = plan_result.get("actions") or []
+    raw_actions = plan_result.get("actions") or []
+    # Filter out dummy or ungrounded actions that were not in user message
+    actions = [a for a in raw_actions if is_grounded_in_user_text(a, user_text)]
+    if not actions and raw_actions:
+        actions = raw_actions  # Fallback if filter was overly aggressive
+
     catalog_map = {f["key"]: f for f in catalog}
 
     processed_actions = []
@@ -216,11 +225,27 @@ def apply_shared_context_and_validate(plan_result, catalog, user_text=""):
 
     for idx, act in enumerate(actions, 1):
         form_key = act.get("form_key")
+        raw_fields = act.get("fields") or {}
+
+        # Guardrail against 1B LLM form confusion (e.g. labeling a complaint as visitor_entry)
+        text_content = f"{act.get('title', '')} {raw_fields.get('details', '')} {raw_fields.get('description', '')} {raw_fields.get('subject', '')}".lower()
+        has_visitor_intent = any(w in text_content for w in ("visitor", "guest", "delivery", "vehicle", "car", "bike", "visit", "arriving", "arrive"))
+        has_complaint_intent = any(w in text_content or w in user_text.lower() for w in ("leak", "pipe", "water", "spark", "electric", "light", "lift", "elevator", "complaint", "broken", "issue", "repair", "maintenance"))
+
+        if form_key == "visitor_entry" and not has_visitor_intent and has_complaint_intent:
+            form_key = "raise_complaint"
+            if not raw_fields.get("details"):
+                for candidate in ("description", "subject", "issue", "problem"):
+                    if raw_fields.get(candidate):
+                        raw_fields["details"] = raw_fields[candidate]
+                        break
+            if not raw_fields.get("details") and act.get("title"):
+                raw_fields["details"] = act.get("title")
+
         form_meta = catalog_map.get(form_key)
         if not form_meta:
             continue
 
-        raw_fields = act.get("fields") or {}
         cleaned_fields = {}
         missing_fields = []
 
@@ -233,65 +258,67 @@ def apply_shared_context_and_validate(plan_result, catalog, user_text=""):
 
             val = raw_fields.get(fname)
 
-            # 1. Action-specific fallback from its own title or details
+            # 1. Action-specific fallback from item title or details (e.g. flat number)
             if (val is None or val == "" or str(val).lower() in ("null", "none")):
-                act_text = f"{act.get('title', '')} {raw_fields.get('details', '')}"
-                if "flat" in fname.lower() and act_text:
-                    m = re.search(r'\b([A-Za-z][-]?\d{2,4})\b', act_text, re.IGNORECASE)
+                if "flat" in fname.lower():
+                    item_text = f"{act.get('title', '')} {raw_fields.get('details', '')} {raw_fields.get('description', '')}"
+                    m = re.search(r'\b([A-Za-z]?\s*[-]?\s*\d{2,4})\b', item_text, re.IGNORECASE)
                     if m:
-                        val = m.group(1).upper()
-                    else:
-                        m_wing = re.search(r'\b([A-Za-z]\s*wing|wing\s*[A-Za-z])\b', act_text, re.IGNORECASE)
-                        if m_wing:
-                            val = m_wing.group(1).title()
+                        val = m.group(1).replace(" ", "").upper()
 
-            # 2. Inherit from shared_context if still empty
+            # 2. Dynamic Shared Context Inheritance
             if val is None or val == "" or str(val).lower() in ("null", "none"):
                 if fname in shared and shared[fname]:
                     val = shared[fname]
-                elif "flat" in fname.lower() and "flat_number" in shared:
-                    val = shared["flat_number"]
-                elif "name" in fname.lower() and "resident_name" in shared and "visitor" not in fname.lower():
-                    val = shared["resident_name"]
-
-            # 3. Urgency fallback if mentioned in details or title
-            if fname == "urgency" and (val is None or str(val).lower() in ("null", "none")):
-                det_text = f"{raw_fields.get('details', '')} {act.get('title', '')}".lower()
-                if any(w in det_text for w in ("urgent", "overflow", "emergency", "immediate", "critical")):
-                    val = "High"
-
-            # 4. Dynamic schema options matching (zero hardcoded domain keywords)
-            if (val is None or val == "" or str(val).lower() in ("null", "none")) and ftype == "select" and options:
-                # For single-action, whole user_text is safe; for multi-action, isolate to item's own context to avoid cross-contamination
-                if not plan_result.get("is_multi_action") and len(actions) == 1:
-                    item_text = f"{user_text} {act.get('title', '')} {raw_fields.get('details', '')}".lower()
                 else:
-                    item_text = f"{act.get('title', '')} {raw_fields.get('details', '')}".lower()
-
-                for opt in options:
-                    if re.search(r'\b' + re.escape(opt.lower()) + r'\b', item_text):
-                        val = opt
-                        break
-                if val is None:
-                    for opt in options:
-                        opt_words = [w.lower() for w in re.findall(r'\b[a-zA-Z0-9]+\b', opt) if len(w) >= 3]
-                        for w in opt_words:
-                            if re.search(r'\b' + re.escape(w) + r'\b', item_text):
-                                val = opt
-                                break
-                        if val is not None:
+                    # Dynamic fuzzy key matching across shared_context keys
+                    fname_lower = fname.lower()
+                    for sk, sv in shared.items():
+                        if not sv:
+                            continue
+                        sk_lower = sk.lower()
+                        if ("visitor" in fname_lower and "resident" in sk_lower) or ("resident" in fname_lower and "visitor" in sk_lower):
+                            continue
+                        if sk_lower == fname_lower or sk_lower in fname_lower or fname_lower in sk_lower:
+                            val = sv
                             break
 
-            # Format normalization
-            if val is not None and str(val).strip():
-                clean_str = str(val).strip()
-                if ftype == "select" and options:
-                    clean_str = _normalize_select_value(clean_str, options)
-                cleaned_fields[fname] = clean_str
+            # 3. Dynamic Schema Options Matching & Normalization
+            if ftype == "select" and options:
+                # If model left option null, check if any allowed option is mentioned in the item's details/title
+                if val is None or val == "" or str(val).lower() in ("null", "none"):
+                    item_text = f"{act.get('title', '')} {raw_fields.get('details', '')} {raw_fields.get('subject', '')} {raw_fields.get('description', '')}".lower()
+                    if not item_text.strip():
+                        item_text = user_text.lower()
+                    for opt in options:
+                        if re.search(r'\b' + re.escape(opt.lower()) + r'\b', item_text):
+                            val = opt
+                            break
+
+                if val is not None and str(val).strip() and str(val).lower() not in ("null", "none"):
+                    norm_val = _normalize_select_value(str(val).strip(), options)
+                    matched_opt = None
+                    for opt in options:
+                        if norm_val.lower() == opt.lower():
+                            matched_opt = opt
+                            break
+                    if matched_opt:
+                        cleaned_fields[fname] = matched_opt
+                    else:
+                        cleaned_fields[fname] = None
+                else:
+                    cleaned_fields[fname] = None
             else:
-                cleaned_fields[fname] = None
-                if is_req:
-                    missing_fields.append(fld["label"])
+                if val is not None and str(val).strip() and str(val).lower() not in ("null", "none"):
+                    cleaned_fields[fname] = str(val).strip()
+                elif fname in ("details", "description") and act.get("title"):
+                    cleaned_fields[fname] = str(act.get("title")).strip()
+                else:
+                    cleaned_fields[fname] = None
+
+            # 4. Dynamic Required Fields Check
+            if is_req and (cleaned_fields[fname] is None or cleaned_fields[fname] == ""):
+                missing_fields.append(fld["label"])
 
         is_action_complete = len(missing_fields) == 0
         if not is_action_complete:
@@ -304,6 +331,7 @@ def apply_shared_context_and_validate(plan_result, catalog, user_text=""):
             "form_key": form_key,
             "form_name": form_meta["name"],
             "title": title,
+            "reasoning": act.get("reasoning", ""),
             "fields": cleaned_fields,
             "schema": {
                 "form_name": form_meta["name"],

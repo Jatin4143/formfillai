@@ -286,16 +286,29 @@ async def get_form_schema_endpoint(request):
 
 
 def is_probable_multi_action(user_text: str) -> bool:
-    """Fast heuristic to check if a message likely contains multiple distinct records/forms."""
+    """Dynamic heuristic to check if a message likely contains multiple distinct records/forms."""
     text_lower = user_text.lower()
-    flats = re.findall(r'\b[a-z]?\s*[-]?\s*\d{3,4}\b', text_lower)
-    if len(flats) >= 2:
+    if any(p in text_lower for p in ("two ", "three ", "four ", "2 ", "3 ", "4 ", "both ", "multiple ", "and also ", "also have ", "as well as ")):
+        if any(sep in text_lower for sep in (",", ";", "\n", " and ")):
+            return True
+
+    try:
+        forms = dp.list_forms()
+        form_matches = 0
+        for f in forms:
+            f_name = f.get("name", "").lower()
+            f_key = f.get("key", "").lower().replace("_", " ")
+            if (f_name and f_name in text_lower) or (f_key and f_key in text_lower):
+                form_matches += 1
+        if form_matches >= 2:
+            return True
+    except Exception:
+        pass
+
+    units = re.findall(r'\b[a-z]?\s*[-]?\s*\d{3,4}\b', text_lower)
+    if len(units) >= 2:
         return True
-    form_kw = sum(1 for kw in ("complaint", "visitor", "notice", "guest") if kw in text_lower)
-    if form_kw >= 2:
-        return True
-    if any(p in text_lower for p in ("two ", "three ", "3 complaints", "2 visitors", "both flats", "multiple")):
-        return True
+
     return False
 
 
@@ -325,6 +338,7 @@ async def chat_endpoint(request):
     form_key = body.get("form_key")
     answers = dict(body.get("answers") or {})
     current_field = body.get("current_field")
+    current_action_id = body.get("current_action_id") or (current_field.get("action_id") if isinstance(current_field, dict) else None)
     chat_id = body.get("chat_id")
     actions = list(body.get("actions") or [])
     is_batch = bool(body.get("is_batch", False))
@@ -413,6 +427,7 @@ async def chat_endpoint(request):
                         "form_key": None,
                         "answers": {},
                         "current_field": None,
+                        "current_action_id": None,
                         "is_batch": True,
                         "actions": plan["actions"],
                         "ready_for_review": True
@@ -421,6 +436,10 @@ async def chat_endpoint(request):
                     incomplete = [a for a in plan["actions"] if not a["is_complete"]]
                     first_inc = incomplete[0]
                     missing_label = first_inc["missing_fields"][0] if first_inc.get("missing_fields") else "required details"
+                    next_fld = next((f for f in first_inc["schema"]["fields"] if f["label"] == missing_label), None)
+                    if next_fld:
+                        next_fld = dict(next_fld)
+                        next_fld["action_id"] = first_inc["id"]
                     reply = f"I've drafted {len(plan['actions'])} items, but need **{missing_label}** for {first_inc['title']}."
                     return make_response({
                         "status": "in_progress",
@@ -428,7 +447,8 @@ async def chat_endpoint(request):
                         "form": first_inc["schema"],
                         "form_key": first_inc["form_key"],
                         "answers": first_inc["fields"],
-                        "current_field": next((f for f in first_inc["schema"]["fields"] if f["label"] == missing_label), None),
+                        "current_field": next_fld,
+                        "current_action_id": first_inc["id"],
                         "is_batch": True,
                         "actions": plan["actions"],
                         "ready_for_review": False
@@ -550,18 +570,41 @@ async def chat_endpoint(request):
     if is_probable_multi_action(user_text):
         plan = mfp.plan_and_extract(user_text)
         if plan and plan.get("is_multi_action"):
-            reply = f"🎉 **Identified and extracted {len(plan['actions'])} items!** Please review and confirm in the pop-up modal."
-            return make_response({
-                "status": "ready" if plan["all_complete"] else "in_progress",
-                "reply": reply,
-                "form": None,
-                "form_key": None,
-                "answers": {},
-                "current_field": None,
-                "is_batch": True,
-                "actions": plan["actions"],
-                "ready_for_review": plan["all_complete"]
-            })
+            if plan["all_complete"]:
+                reply = f"🎉 **Identified and extracted {len(plan['actions'])} items!** Please review and confirm in the pop-up modal."
+                return make_response({
+                    "status": "ready",
+                    "reply": reply,
+                    "form": None,
+                    "form_key": None,
+                    "answers": {},
+                    "current_field": None,
+                    "current_action_id": None,
+                    "is_batch": True,
+                    "actions": plan["actions"],
+                    "ready_for_review": True
+                })
+            else:
+                incomplete = [a for a in plan["actions"] if not a["is_complete"]]
+                first_inc = incomplete[0]
+                missing_label = first_inc["missing_fields"][0] if first_inc.get("missing_fields") else "required details"
+                next_fld = next((f for f in first_inc["schema"]["fields"] if f["label"] == missing_label), None)
+                if next_fld:
+                    next_fld = dict(next_fld)
+                    next_fld["action_id"] = first_inc["id"]
+                reply = f"I've drafted {len(plan['actions'])} items, but need **{missing_label}** for {first_inc['title']}."
+                return make_response({
+                    "status": "in_progress",
+                    "reply": reply,
+                    "form": first_inc["schema"],
+                    "form_key": first_inc["form_key"],
+                    "answers": first_inc["fields"],
+                    "current_field": next_fld,
+                    "current_action_id": first_inc["id"],
+                    "is_batch": True,
+                    "actions": plan["actions"],
+                    "ready_for_review": False
+                })
 
     # Check if user wants to switch form mid-way
     switch_key = should_switch_to_form(user_text, form_key)
@@ -656,24 +699,26 @@ async def chat_endpoint(request):
     # 4. If this is an active batch session, sync newly answered field into the actions basket!
     if is_batch and actions:
         target_act = None
-        for act in actions:
-            if act.get("form_key") == form_key and not act.get("is_complete"):
-                target_act = act
-                break
+        if current_action_id:
+            target_act = next((a for a in actions if a.get("id") == current_action_id), None)
         if not target_act:
-            for act in actions:
-                if act.get("form_key") == form_key:
-                    target_act = act
-                    break
+            target_act = next((a for a in actions if a.get("form_key") == form_key and not a.get("is_complete")), None)
+        if not target_act:
+            target_act = next((a for a in actions if not a.get("is_complete")), None)
 
         if target_act:
-            target_act.setdefault("fields", {}).update({
-                k: v for k, v in answers.items() if v is not None and str(v).strip() != "" and str(v).lower() != "null"
-            })
+            target_fields = target_act.setdefault("fields", {})
+            if f_name and f_name in answers and answers[f_name] is not None and str(answers[f_name]).strip() != "":
+                target_fields[f_name] = answers[f_name]
+            for ak, av in accepted.items():
+                if av is not None and str(av).strip() != "":
+                    target_fields[ak] = av
+
+            # Recalculate missing fields dynamically against target_act schema
             missing = []
             for fld in target_act["schema"]["fields"]:
                 if fld.get("required", True):
-                    fval = target_act["fields"].get(fld["name"])
+                    fval = target_fields.get(fld["name"])
                     if fval is None or str(fval).strip() == "" or str(fval).lower() == "null":
                         missing.append(fld["label"])
             target_act["missing_fields"] = missing
@@ -690,6 +735,7 @@ async def chat_endpoint(request):
                 "form_key": None,
                 "answers": {},
                 "current_field": None,
+                "current_action_id": None,
                 "is_batch": True,
                 "actions": actions,
                 "ready_for_review": True
@@ -698,6 +744,10 @@ async def chat_endpoint(request):
             first_inc = incomplete[0]
             missing_label = first_inc["missing_fields"][0] if first_inc.get("missing_fields") else "required details"
             next_fld = next((f for f in first_inc["schema"]["fields"] if f["label"] == missing_label), None)
+            if next_fld:
+                next_fld = dict(next_fld)
+                next_fld["action_id"] = first_inc["id"]
+
             reply = f"Saved {current_field['label'] if current_field else 'answer'}. Next, please provide **{missing_label}** for {first_inc['title']}."
             return make_response({
                 "status": "in_progress",
@@ -706,6 +756,7 @@ async def chat_endpoint(request):
                 "form_key": first_inc["form_key"],
                 "answers": first_inc["fields"],
                 "current_field": next_fld,
+                "current_action_id": first_inc["id"],
                 "is_batch": True,
                 "actions": actions,
                 "ready_for_review": False
