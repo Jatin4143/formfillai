@@ -135,6 +135,32 @@ def is_valid_indian_plate(text: str) -> bool:
     return bool(INDIAN_PLATE_RE.match(text.strip()))
 
 
+def normalize_date(text: str) -> str | None:
+    """Normalize date text (e.g. '5 dec', 'tomorrow', '20/11/2026') to standard 'YYYY-MM-DD'."""
+    if not text or not text.strip():
+        return None
+    s = text.strip().lower()
+    today = date.today()
+    if s == "today":
+        return today.isoformat()
+    if s == "tomorrow":
+        return (today + timedelta(days=1)).isoformat()
+    if not re.search(r"\d", s):
+        return None
+    try:
+        from dateutil import parser as dt_parser
+        is_year_first = bool(re.match(r"^\d{4}[-/.]", s))
+        dt = dt_parser.parse(s, yearfirst=is_year_first, dayfirst=not is_year_first)
+        return dt.date().isoformat()
+    except Exception:
+        return None
+
+
+def is_valid_date(text: str) -> bool:
+    """Check if the provided text is a valid date (rejects random text like 'hcc')."""
+    return normalize_date(text) is not None
+
+
 NO_VEHICLE_PATTERNS = [
     r"\bno\s*(car|vehicle|vehical|bike|motorcycle|scooter|two\s*wheeler|four\s*wheeler|plate|cab|taxi|auto)\b",
     r"\bwithout\s*(a\s*|any\s*)?(car|vehicle|vehical|bike|motorcycle|scooter|two\s*wheeler|four\s*wheeler|plate)\b",
@@ -435,7 +461,34 @@ def init_db():
                     INSERT OR IGNORE INTO form_fields (form_id, name, label, type, required, options, sort_order)
                     SELECT id, 'urgency', 'Urgency', 'select', 0, '["Low", "Medium", "High"]', 4
                     FROM forms WHERE key = 'raise_complaint';
+
+                    -- Facility Booking
+                    INSERT OR IGNORE INTO forms (key, name, aliases) VALUES
+                    ('facility_booking', 'Facility Booking',
+                     '["facility booking", "book facility", "amenity booking", "clubhouse booking"]');
+
+                    INSERT OR IGNORE INTO form_fields (form_id, name, label, type, required, options, sort_order)
+                    SELECT id, 'facility', 'Facility', 'select', 1, '["Clubhouse", "Party Hall", "Gym", "Swimming Pool", "Sports Court", "Other"]', 1
+                    FROM forms WHERE key = 'facility_booking';
+
+                    INSERT OR IGNORE INTO form_fields (form_id, name, label, type, required, options, sort_order)
+                    SELECT id, 'booking_date', 'Booking Date', 'date', 1, NULL, 2
+                    FROM forms WHERE key = 'facility_booking';
+
+                    INSERT OR IGNORE INTO form_fields (form_id, name, label, type, required, options, sort_order)
+                    SELECT id, 'time_slot', 'Time Slot', 'select', 1, '["Morning", "Afternoon", "Evening"]', 3
+                    FROM forms WHERE key = 'facility_booking';
+
+                    INSERT OR IGNORE INTO form_fields (form_id, name, label, type, required, options, sort_order)
+                    SELECT id, 'purpose', 'Purpose', 'textarea', 0, NULL, 4
+                    FROM forms WHERE key = 'facility_booking';
+
+                    INSERT OR IGNORE INTO form_fields (form_id, name, label, type, required, options, sort_order)
+                    SELECT id, 'number_of_people', 'Number of People', 'number', 0, NULL, 5
+                    FROM forms WHERE key = 'facility_booking';
                 """)
+            # Ensure any date fields are typed as 'date'
+            conn.execute("UPDATE form_fields SET type = 'date' WHERE (name LIKE '%date%' OR label LIKE '%date%') AND type = 'text'")
     except sqlite3.Error as exc:
         log.error("Failed to initialize database: %s", exc)
     finally:
@@ -733,6 +786,7 @@ def validate_answer(field, user_input):
 
     field_name = field.get("name", "").lower()
     field_type = field.get("type", "text").lower()
+    field_label = field.get("label", "").lower()
 
     # 1. Select options
     if field_type == "select" and options:
@@ -741,7 +795,14 @@ def validate_answer(field, user_input):
             return False, f"Please choose one of: {', '.join(options)}"
         return True, matched
 
-    # 2. Vehicle registration plate (for fields mentioning vehicle/plate)
+    # 2. Date fields
+    if field_type == "date" or "date" in field_name:
+        norm = normalize_date(cleaned)
+        if not norm:
+            return False, f"Please enter a valid date for {field['label']}."
+        return True, norm
+
+    # 3. Vehicle registration plate (for fields mentioning vehicle/plate)
     if "vehicle" in field_name or "plate" in field_name:
         if not required and (NO_VEHICLE_RE.search(cleaned) or cleaned.lower() in ("no", "none", "na", "n/a", "nil", "skip")):
             return True, None
@@ -991,6 +1052,11 @@ Extract all present fields as JSON:
                 if veh_match:
                     final_extracted[name] = normalize_plate(veh_match.group(1))
 
+    # Fallback for notice wing: general notices default to "All" wings if no specific wing is mentioned
+    if "notice" in form_name.lower():
+        if "wing" in allowed and "wing" not in final_extracted:
+            final_extracted["wing"] = "All"
+
     log.info("EXTRACT done | form=%s extracted=%s", form_name, final_extracted)
     return final_extracted
 
@@ -1130,6 +1196,9 @@ Return JSON:
                 veh_match = INDIAN_PLATE_EXTRACT_RE.search(user_text)
                 if veh_match:
                     extracted[name] = normalize_plate(veh_match.group(1))
+
+    if form_key == "add_notice" and "wing" in allowed and "wing" not in extracted:
+        extracted["wing"] = "All"
 
     log.info("CLASSIFY done | form=%s fields=%s", form_key, extracted)
     return form_key, extracted
@@ -1558,6 +1627,9 @@ def start_form(form_key, user_text, prefilled=None):
                 form["schema"], user_text, st.session_state.answers
             )
             accepted.update(more_accepted)
+
+    if form_key == "add_notice" and "wing" not in st.session_state.answers:
+        st.session_state.answers["wing"] = "All"
 
     overview_msg = build_form_overview_message(form, accepted=accepted)
     st.session_state.messages.append(

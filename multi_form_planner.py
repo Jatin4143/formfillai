@@ -100,6 +100,7 @@ RULES:
 2. ACCURATE FIELD EXTRACTION (REQUIRED & OPTIONAL):
    - Extract BOTH required and optional fields directly from the user's message whenever mentioned in the text. Do not leave optional fields null if the user provided that detail.
    - For fields with predefined options, select the best matching exact option from the schema (or null if none reasonably matches).
+   - For "add_notice", if no specific wing (like A Wing, B Wing, C Wing) is mentioned, set wing to "All" (general notice for all wings).
    - If a field is not mentioned, set its value to null.
    - Never output placeholder strings, template brackets, or invented values.
 
@@ -346,6 +347,9 @@ def apply_shared_context_and_validate(plan_result, catalog, user_text=""):
                             cleaned_fields[fname] = re.sub(r"\s+", " ", clean_str.upper())
                         else:
                             cleaned_fields[fname] = None
+                    elif ftype == "date" or "date" in fname.lower():
+                        import demo_paragraph as dp
+                        cleaned_fields[fname] = dp.normalize_date(clean_str)
                     else:
                         cleaned_fields[fname] = clean_str
                 else:
@@ -354,6 +358,10 @@ def apply_shared_context_and_validate(plan_result, catalog, user_text=""):
             # 3. Dynamic Required Fields Check
             if is_req and (cleaned_fields[fname] is None or cleaned_fields[fname] == ""):
                 missing_fields.append(fld["label"])
+
+        # Default general notice to 'All' wings if no specific wing is strictly mentioned
+        if form_key == "add_notice" and not cleaned_fields.get("wing"):
+            cleaned_fields["wing"] = "All"
 
         is_action_complete = len(missing_fields) == 0
         if not is_action_complete:

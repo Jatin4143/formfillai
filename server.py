@@ -398,7 +398,10 @@ async def chat_endpoint(request):
         if direct_key:
             form = dp.fetch_form_schema(direct_key)
             if form and dp.message_is_only_form_name(user_text, form):
-                first_field = form["schema"]["fields"][0] if form["schema"]["fields"] else None
+                answers = {}
+                if direct_key == "add_notice":
+                    answers["wing"] = "All"
+                first_field = dp.get_next_field(form["schema"], answers)
                 question = dp.get_question_for_field(form, first_field) if first_field else ""
                 reply = f"Let's fill out **{form['form_name']}**.\n\n{question}"
                 return make_response({
@@ -406,7 +409,7 @@ async def chat_endpoint(request):
                     "reply": reply,
                     "form": form,
                     "form_key": direct_key,
-                    "answers": {},
+                    "answers": answers,
                     "current_field": first_field,
                     "is_batch": False,
                     "actions": [],
@@ -532,6 +535,9 @@ async def chat_endpoint(request):
             more_accepted = dp.apply_extracted_answers(form["schema"], user_text, answers)
             accepted.update(more_accepted)
 
+        if detected_key == "add_notice" and "wing" not in answers:
+            answers["wing"] = "All"
+
         next_field = dp.get_next_field(form["schema"], answers)
 
         if next_field is None:
@@ -619,6 +625,8 @@ async def chat_endpoint(request):
         accepted = {}
         if not dp.message_is_only_form_name(user_text, new_form):
             accepted = dp.apply_extracted_answers(new_form["schema"], user_text, new_answers)
+        if switch_key == "add_notice" and "wing" not in new_answers:
+            new_answers["wing"] = "All"
         overview_msg = dp.build_form_overview_message(new_form, accepted=accepted)
         next_field = dp.get_next_field(new_form["schema"], new_answers)
         if next_field is None:

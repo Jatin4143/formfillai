@@ -625,10 +625,19 @@
         card.appendChild(textarea);
       } else {
         const input = document.createElement('input');
-        input.type = 'text';
+        input.type = field.type === 'date' ? 'date' : 'text';
         input.className = 'modal-input';
         input.name = field.name;
         input.value = val;
+        if (field.type === 'date' && val && !input.value) {
+          const d = new Date(val);
+          if (!isNaN(d.getTime())) {
+            const y = d.getFullYear() <= 2001 ? new Date().getFullYear() : d.getFullYear();
+            const m = String(d.getMonth() + 1).padStart(2, '0');
+            const day = String(d.getDate()).padStart(2, '0');
+            input.value = `${y}-${m}-${day}`;
+          }
+        }
         if (field.name === 'vehicle_number') {
           input.placeholder = 'e.g. MH12AB1234';
         }
@@ -717,10 +726,19 @@
           fieldCard.appendChild(textarea);
         } else {
           const input = document.createElement('input');
-          input.type = 'text';
+          input.type = field.type === 'date' ? 'date' : 'text';
           input.className = 'modal-input';
           input.dataset.fieldName = field.name;
           input.value = val;
+          if (field.type === 'date' && val && !input.value) {
+            const d = new Date(val);
+            if (!isNaN(d.getTime())) {
+              const y = d.getFullYear() <= 2001 ? new Date().getFullYear() : d.getFullYear();
+              const m = String(d.getMonth() + 1).padStart(2, '0');
+              const day = String(d.getDate()).padStart(2, '0');
+              input.value = `${y}-${m}-${day}`;
+            }
+          }
           fieldCard.appendChild(input);
         }
 
