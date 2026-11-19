@@ -7,6 +7,7 @@ Works for ANY form defined in forms.db with zero hardcoded form keys or aliases.
 Uses Ollama (MODEL from .env, default llama3.2:1b).
 """
 
+from datetime import datetime, timezone
 import json
 import logging
 import os
@@ -17,6 +18,9 @@ import uuid
 
 import ollama
 from config import MODEL, OLLAMA_BASE_URL, DB_PATH, ollama_client
+
+INDIAN_PLATE_PATTERN = r"^(?:[A-Z]{2}[ -]?\d{1,2}[ -]?[A-Z]{1,3}[ -]?\d{1,4}|\d{2}[ -]?BH[ -]?\d{4}[ -]?[A-HJ-NP-Z]{1,2})$"
+INDIAN_PLATE_RE = re.compile(INDIAN_PLATE_PATTERN, re.IGNORECASE)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("multi_form_planner")
@@ -84,31 +88,34 @@ def get_form_by_key(form_key: str, catalog=None):
 
 
 PLANNER_SYSTEM_PROMPT = """You are an intelligent, schema-driven multi-form planner and data extractor.
-You analyze the user's message against the available forms catalog and output a clean JSON action plan.
+You analyze the user's message against the dynamically provided forms catalog and output a clean JSON action plan.
 
-CRITICAL RULES:
-1. ONLY EXTRACT WHAT THE USER MENTIONED:
-   - Extract ONLY the specific items described in the User Message.
-   - NEVER create actions for forms that the user did not ask for.
-   - NEVER invent, hallucinate, or output dummy records, fake names, or fake flat numbers.
-   - If the user reports 2 maintenance issues, output EXACTLY 2 actions with form_key: "raise_complaint". Do NOT create visitor entries or notices.
+RULES:
+1. EXHAUSTIVE & PURE INTENT EXTRACTION:
+   - Carefully inspect the available form names and field descriptions in the catalog.
+   - Read the user's message sentence by sentence from start to finish and extract a separate action for EVERY distinct request, record, person, or event mentioned.
+   - Do NOT skip, merge, or drop any item — if the same form is described multiple times (even 3 or more times), output a separate action for each one in order.
+   - Extract an action ONLY if the user explicitly requested or described that form. NEVER invent or output forms that the user did not mention.
 
-2. ONE ACTION PER DISTINCT ISSUE:
-   - Separate issues or units into distinct actions (e.g. Flat 101 sink leak, Flat 102 elevator buttons).
+2. ACCURATE FIELD EXTRACTION (REQUIRED & OPTIONAL):
+   - Extract BOTH required and optional fields directly from the user's message whenever mentioned in the text. Do not leave optional fields null if the user provided that detail.
+   - For fields with predefined options, select the best matching exact option from the schema (or null if none reasonably matches).
+   - If a field is not mentioned, set its value to null.
+   - Never output placeholder strings, template brackets, or invented values.
 
-3. SCHEMA-GROUNDED OPTIONS:
-   - For fields with "options" (e.g. category, purpose): select the best matching option from the schema's options list.
+3. SHARED CONTEXT:
+   - Put a field in shared_context ONLY if it clearly applies globally to ALL extracted actions. If different items mention different values (e.g. different flats), keep each value inside its own action's fields and leave shared_context empty.
 
 Output Schema:
 {
-  "is_multi_action": true/false,
+  "is_multi_action": true,
   "shared_context": {},
   "actions": [
     {
-      "form_key": "<exact key from catalog>",
-      "title": "<short descriptive title>",
+      "form_key": "matching_key_from_catalog",
+      "title": "Descriptive title for this action",
       "fields": {
-        "<field_name>": "<value_or_null>"
+        "field_name": "extracted_value"
       }
     }
   ]
@@ -119,19 +126,39 @@ CONVERSATIONAL_SYSTEM_PROMPT = """You are FieldFlow AI, a courteous and helpful 
 The user sent a greeting, pleasantry, or conversational question (such as 'hy', 'helo', 'hiii', 'how are you', 'can you help me', 'good morning', 'thanks', etc.).
 
 Instructions:
-1. Reply warmly and naturally in ONE short, friendly sentence.
-2. Let them know you can help them fill out forms, register visitors, or raise maintenance complaints.
+1. Reply warmly and naturally in ONE or TWO short, friendly sentences.
+2. Mention the exact available forms provided below and ask which form they need to fill.
 3. Plain text only. Never write bulleted lists, numbered menus, or multiple steps."""
 
 
 def generate_conversational_reply(user_text: str) -> str:
-    """Uses the model to generate a warm, natural 1-sentence reply for greetings and pleasantries."""
+    """Uses the model to generate a warm, natural reply listing the live available forms."""
+    try:
+        catalog = get_live_catalog()
+        form_names = [f["name"] for f in catalog if f.get("name")]
+    except Exception:
+        form_names = []
+
+    if form_names:
+        if len(form_names) == 1:
+            forms_str = form_names[0]
+        elif len(form_names) == 2:
+            forms_str = f"{form_names[0]} and {form_names[1]}"
+        else:
+            forms_str = ", ".join(form_names[:-1]) + f", and {form_names[-1]}"
+        form_word = "form" if len(form_names) == 1 else "forms"
+        fallback = f"Hello! For now we provide {len(form_names)} {form_word}: {forms_str}. Which form do you need to fill?"
+        system_prompt = f"{CONVERSATIONAL_SYSTEM_PROMPT}\n\nAvailable forms ({len(form_names)}): {forms_str}"
+    else:
+        fallback = "Hello! I am here to help you fill out forms. Which form do you need to fill?"
+        system_prompt = CONVERSATIONAL_SYSTEM_PROMPT
+
     try:
         response = ollama_client.chat(
             model=MODEL,
             options={"temperature": 0.3, "num_predict": 100},
             messages=[
-                {"role": "system", "content": CONVERSATIONAL_SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_text},
             ],
         )
@@ -141,7 +168,7 @@ def generate_conversational_reply(user_text: str) -> str:
     except Exception as exc:
         log.warning("Conversational reply failed: %s", exc)
 
-    return "Hello! I am here to help you fill out forms, register visitors, or report maintenance requests. How can I assist you today?"
+    return fallback
 
 
 def _normalize_select_value(raw_val, options):
@@ -157,68 +184,116 @@ def _normalize_select_value(raw_val, options):
     return raw_val
 
 
-def is_grounded_in_user_text(act, user_text: str) -> bool:
+def _clean_val(val):
+    if val is None:
+        return None
+    s = str(val).strip()
+    if ("<" in s and ">" in s) or s.lower() in ("null", "none", "nil", "n/a", "undefined", "<null>"):
+        return None
+    return s
+
+
+def is_grounded_in_user_text(act, user_text: str, catalog_map=None) -> bool:
     """
-    Strict anti-hallucination guardrail:
-    Filters out any dummy/example actions hallucinated by small models
-    (such as fake visitors, dummy notices, or unmentioned flats/issues).
+    Schema-driven anti-hallucination guardrail:
+    Checks if the model-extracted action corresponds to something in the user text.
+    Uses purely dynamic SQLite form metadata (form name, fields, and options).
     """
     if not user_text or not user_text.strip():
         return True
 
     text_lower = user_text.lower()
     form_key = act.get("form_key")
-    raw_fields = act.get("fields") or {}
+    raw_fields = act.get("fields")
+    if not isinstance(raw_fields, dict):
+        raw_fields = {}
 
-    # 1. Intent check for specific form domains
-    if form_key == "visitor_entry":
-        if not any(w in text_lower for w in ("visitor", "guest", "delivery", "vehicle", "car", "bike", "cab", "courier", "swiggy", "zomato", "uber", "visit", "arriving", "arrive")):
-            return False
-
-    if form_key == "add_notice":
-        if not any(w in text_lower for w in ("notice", "announcement", "circular", "broadcast", "post a notice")):
-            return False
-
+    # 1. If the action extracted any concrete field value that appears in user_text, it is grounded
     user_words = set(re.findall(r'\b[a-zA-Z0-9]{2,}\b', text_lower))
+    for fv in raw_fields.values():
+        cleaned = _clean_val(fv)
+        if not cleaned:
+            continue
+        val_words = [w.lower() for w in re.findall(r'\b[a-zA-Z0-9]{2,}\b', cleaned)]
+        if val_words and any(w in user_words for w in val_words):
+            return True
 
-    # 2. Check identifying entity details (flat number, visitor name, vehicle number)
-    specific_identifiers = [
-        str(raw_fields.get("visitor_name") or ""),
-        str(raw_fields.get("flat_number") or ""),
-        str(raw_fields.get("vehicle_number") or ""),
-    ]
-    specific_str = " ".join(specific_identifiers).strip()
-    if specific_str:
-        specific_words = [
-            w.lower() for w in re.findall(r'\b[a-zA-Z0-9]{2,}\b', specific_str)
-            if w.lower() not in ("flat", "wing", "room", "number", "all", "none", "null")
-        ]
-        if specific_words and not any(w in user_words for w in specific_words):
-            return False
+    # 2. Otherwise check against form metadata from SQLite dynamically
+    if catalog_map and form_key in catalog_map:
+        form_meta = catalog_map[form_key]
+        domain_tokens = set(re.findall(r'\b[a-zA-Z]{3,}\b', form_meta["name"].lower()))
+        for fld in form_meta["fields"]:
+            domain_tokens.update(re.findall(r'\b[a-zA-Z]{3,}\b', fld["name"].lower()))
+            domain_tokens.update(re.findall(r'\b[a-zA-Z]{3,}\b', fld["label"].lower()))
+            if fld.get("options"):
+                for opt in fld["options"]:
+                    domain_tokens.update(re.findall(r'\b[a-zA-Z]{3,}\b', str(opt).lower()))
 
-    # 3. Check details/description text overlap
-    details_str = str(raw_fields.get("details") or raw_fields.get("description") or act.get("title") or "")
-    details_words = [
-        w.lower() for w in re.findall(r'\b[a-zA-Z0-9]{3,}\b', details_str)
-        if w.lower() not in ("flat", "wing", "room", "number", "issue", "issues", "maintenance", "reported", "report", "complaint", "other")
-    ]
-    if details_words:
-        overlap = sum(1 for w in details_words if w in user_words)
-        if overlap == 0:
+        if not (domain_tokens & user_words):
             return False
 
     return True
 
 
 def apply_shared_context_and_validate(plan_result, catalog, user_text=""):
-    shared = plan_result.get("shared_context") or {}
+    shared_raw = plan_result.get("shared_context") or {}
+    shared = {k: _clean_val(v) for k, v in shared_raw.items() if _clean_val(v) is not None}
     raw_actions = plan_result.get("actions") or []
-    # Filter out dummy or ungrounded actions that were not in user message
-    actions = [a for a in raw_actions if is_grounded_in_user_text(a, user_text)]
-    if not actions and raw_actions:
-        actions = raw_actions  # Fallback if filter was overly aggressive
-
     catalog_map = {f["key"]: f for f in catalog}
+
+    # Clean any bracketed placeholders and normalize raw action fields
+    for a in raw_actions:
+        flds = a.get("fields")
+        if not isinstance(flds, dict):
+            a["fields"] = {}
+        for fk, fv in list(a["fields"].items()):
+            a["fields"][fk] = _clean_val(fv)
+
+    # Filter out dummy or ungrounded actions that were not in user message
+    actions = [a for a in raw_actions if is_grounded_in_user_text(a, user_text, catalog_map=catalog_map)]
+    if not actions and raw_actions:
+        actions = raw_actions
+
+    # Deduplicate ONLY true duplicates: same form_key, zero conflicting non-empty fields,
+    # and either identical fields or matching non-select (identifying text) fields.
+    deduped = []
+    for act in actions:
+        fkey = act.get("form_key")
+        fields = act.get("fields") or {}
+        form_meta = catalog_map.get(fkey)
+        select_field_names = {
+            fld["name"] for fld in (form_meta["fields"] if form_meta else [])
+            if fld.get("type") == "select"
+        }
+
+        is_dup = False
+        for ex in deduped:
+            if ex.get("form_key") != fkey:
+                continue
+            ex_fields = ex.get("fields") or {}
+
+            has_conflict = False
+            has_non_select_match = False
+            all_keys = set(fields.keys()) | set(ex_fields.keys())
+            for k in all_keys:
+                v1 = _clean_val(fields.get(k))
+                v2 = _clean_val(ex_fields.get(k))
+                if v1 and v2:
+                    if v1.lower() != v2.lower():
+                        has_conflict = True
+                        break
+                    elif k not in select_field_names:
+                        has_non_select_match = True
+
+            if not has_conflict and (has_non_select_match or fields == ex_fields):
+                is_dup = True
+                for k, v in fields.items():
+                    if v and not ex_fields.get(k):
+                        ex_fields[k] = v
+                break
+        if not is_dup:
+            deduped.append(act)
+    actions = deduped
 
     processed_actions = []
     all_complete = True
@@ -226,22 +301,6 @@ def apply_shared_context_and_validate(plan_result, catalog, user_text=""):
     for idx, act in enumerate(actions, 1):
         form_key = act.get("form_key")
         raw_fields = act.get("fields") or {}
-
-        # Guardrail against 1B LLM form confusion (e.g. labeling a complaint as visitor_entry)
-        text_content = f"{act.get('title', '')} {raw_fields.get('details', '')} {raw_fields.get('description', '')} {raw_fields.get('subject', '')}".lower()
-        has_visitor_intent = any(w in text_content for w in ("visitor", "guest", "delivery", "vehicle", "car", "bike", "visit", "arriving", "arrive"))
-        has_complaint_intent = any(w in text_content or w in user_text.lower() for w in ("leak", "pipe", "water", "spark", "electric", "light", "lift", "elevator", "complaint", "broken", "issue", "repair", "maintenance"))
-
-        if form_key == "visitor_entry" and not has_visitor_intent and has_complaint_intent:
-            form_key = "raise_complaint"
-            if not raw_fields.get("details"):
-                for candidate in ("description", "subject", "issue", "problem"):
-                    if raw_fields.get(candidate):
-                        raw_fields["details"] = raw_fields[candidate]
-                        break
-            if not raw_fields.get("details") and act.get("title"):
-                raw_fields["details"] = act.get("title")
-
         form_meta = catalog_map.get(form_key)
         if not form_meta:
             continue
@@ -249,52 +308,26 @@ def apply_shared_context_and_validate(plan_result, catalog, user_text=""):
         cleaned_fields = {}
         missing_fields = []
 
-        # Context inheritance & normalization
         for fld in form_meta["fields"]:
             fname = fld["name"]
             ftype = fld.get("type", "text")
             options = fld.get("options")
             is_req = fld.get("required", True)
 
-            val = raw_fields.get(fname)
+            val = _clean_val(raw_fields.get(fname))
 
-            # 1. Action-specific fallback from item title or details (e.g. flat number)
-            if (val is None or val == "" or str(val).lower() in ("null", "none")):
-                if "flat" in fname.lower():
-                    item_text = f"{act.get('title', '')} {raw_fields.get('details', '')} {raw_fields.get('description', '')}"
-                    m = re.search(r'\b([A-Za-z]?\s*[-]?\s*\d{2,4})\b', item_text, re.IGNORECASE)
-                    if m:
-                        val = m.group(1).replace(" ", "").upper()
-
-            # 2. Dynamic Shared Context Inheritance
-            if val is None or val == "" or str(val).lower() in ("null", "none"):
+            # 1. Shared Context Inheritance
+            if val is None:
                 if fname in shared and shared[fname]:
                     val = shared[fname]
                 else:
-                    # Dynamic fuzzy key matching across shared_context keys
-                    fname_lower = fname.lower()
                     for sk, sv in shared.items():
-                        if not sv:
-                            continue
-                        sk_lower = sk.lower()
-                        if ("visitor" in fname_lower and "resident" in sk_lower) or ("resident" in fname_lower and "visitor" in sk_lower):
-                            continue
-                        if sk_lower == fname_lower or sk_lower in fname_lower or fname_lower in sk_lower:
+                        if sv and (sk.lower() == fname.lower() or sk.lower() in fname.lower() or fname.lower() in sk.lower()):
                             val = sv
                             break
 
-            # 3. Dynamic Schema Options Matching & Normalization
+            # 2. Dynamic Schema Options Matching & Normalization
             if ftype == "select" and options:
-                # If model left option null, check if any allowed option is mentioned in the item's details/title
-                if val is None or val == "" or str(val).lower() in ("null", "none"):
-                    item_text = f"{act.get('title', '')} {raw_fields.get('details', '')} {raw_fields.get('subject', '')} {raw_fields.get('description', '')}".lower()
-                    if not item_text.strip():
-                        item_text = user_text.lower()
-                    for opt in options:
-                        if re.search(r'\b' + re.escape(opt.lower()) + r'\b', item_text):
-                            val = opt
-                            break
-
                 if val is not None and str(val).strip() and str(val).lower() not in ("null", "none"):
                     norm_val = _normalize_select_value(str(val).strip(), options)
                     matched_opt = None
@@ -302,21 +335,23 @@ def apply_shared_context_and_validate(plan_result, catalog, user_text=""):
                         if norm_val.lower() == opt.lower():
                             matched_opt = opt
                             break
-                    if matched_opt:
-                        cleaned_fields[fname] = matched_opt
-                    else:
-                        cleaned_fields[fname] = None
+                    cleaned_fields[fname] = matched_opt
                 else:
                     cleaned_fields[fname] = None
             else:
                 if val is not None and str(val).strip() and str(val).lower() not in ("null", "none"):
-                    cleaned_fields[fname] = str(val).strip()
-                elif fname in ("details", "description") and act.get("title"):
-                    cleaned_fields[fname] = str(act.get("title")).strip()
+                    clean_str = str(val).strip()
+                    if "vehicle" in fname.lower() or "plate" in fname.lower():
+                        if INDIAN_PLATE_RE.match(clean_str):
+                            cleaned_fields[fname] = re.sub(r"\s+", " ", clean_str.upper())
+                        else:
+                            cleaned_fields[fname] = None
+                    else:
+                        cleaned_fields[fname] = clean_str
                 else:
                     cleaned_fields[fname] = None
 
-            # 4. Dynamic Required Fields Check
+            # 3. Dynamic Required Fields Check
             if is_req and (cleaned_fields[fname] is None or cleaned_fields[fname] == ""):
                 missing_fields.append(fld["label"])
 
@@ -391,7 +426,7 @@ Extract the action plan according to instructions as JSON:"""
         response = ollama_client.chat(
             model=MODEL,
             format="json",
-            options={"temperature": 0.0},
+            options={"temperature": 0.0, "num_ctx": 8192, "num_predict": 4096},
             messages=[
                 {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},
@@ -431,7 +466,17 @@ def execute_batch_submission(items, chat_id=None):
         with conn:
             for item in items:
                 fkey = item.get("form_key")
-                answers = item.get("answers") or {}
+                answers = dict(item.get("answers") or {})
+
+                for k, v in list(answers.items()):
+                    if v is not None and str(v).strip() and ("vehicle" in k.lower() or "plate" in k.lower()):
+                        clean_plate = str(v).strip()
+                        if not INDIAN_PLATE_RE.match(clean_plate):
+                            return {
+                                "success": False,
+                                "error": f"Invalid Indian vehicle number plate: '{clean_plate}' (e.g. MH 12 AB 1234).",
+                            }
+                        answers[k] = re.sub(r"\s+", " ", clean_plate.upper())
 
                 row = conn.execute("SELECT id, name FROM forms WHERE key = ?", (fkey,)).fetchone()
                 if not row:
@@ -450,14 +495,42 @@ def execute_batch_submission(items, chat_id=None):
                 })
 
             if chat_id and submission_ids:
-                conn.execute(
-                    """
-                    UPDATE chats 
-                    SET completed = 1, submission_id = ?, updated_at = CURRENT_TIMESTAMP
-                    WHERE id = ?
-                    """,
-                    (submission_ids[-1]["submission_id"], chat_id),
-                )
+                chat_row = conn.execute(
+                    "SELECT messages_json FROM chats WHERE id = ?",
+                    (chat_id,),
+                ).fetchone()
+                if chat_row:
+                    try:
+                        messages = json.loads(chat_row["messages_json"] or "[]")
+                    except Exception:
+                        messages = []
+                    messages.append({
+                        "role": "assistant",
+                        "content": f"All set! **{len(submission_ids)} submissions** recorded successfully:",
+                        "receipt_data": {
+                            "is_multi": True,
+                            "records": submission_ids,
+                        },
+                    })
+                    conn.execute(
+                        """
+                        UPDATE chats
+                        SET messages_json = ?,
+                            answers_json = '{}',
+                            form_key = NULL,
+                            current_field_name = NULL,
+                            completed = 1,
+                            submission_id = ?,
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            json.dumps(messages),
+                            submission_ids[-1]["submission_id"],
+                            datetime.now(timezone.utc).isoformat(),
+                            chat_id,
+                        ),
+                    )
 
         return {
             "success": True,

@@ -444,7 +444,7 @@ async def chat_endpoint(request):
                     return make_response({
                         "status": "in_progress",
                         "reply": reply,
-                        "form": first_inc["schema"],
+                        "form": dp.fetch_form_schema(first_inc["form_key"]),
                         "form_key": first_inc["form_key"],
                         "answers": first_inc["fields"],
                         "current_field": next_fld,
@@ -456,13 +456,18 @@ async def chat_endpoint(request):
             else:
                 # Single action identified by the planner
                 act = plan["actions"][0]
-                single_form = act["schema"]
+                single_form = dp.fetch_form_schema(act["form_key"]) or {
+                    "key": act["form_key"],
+                    "form_name": act["form_name"],
+                    "schema": act["schema"],
+                }
+                single_schema = single_form["schema"]
                 # Only keep fields that actually have non-null, non-empty values
                 single_answers = {
                     k: v for k, v in (act.get("fields") or {}).items()
                     if v is not None and str(v).strip() != "" and str(v).lower() != "null"
                 }
-                if act.get("is_complete") and dp.get_next_field(single_form, single_answers) is None:
+                if act.get("is_complete") and dp.get_next_field(single_schema, single_answers) is None:
                     reply = f"🎉 **All details have been extracted for {act['form_name']}!** Please review and confirm in the pop-up modal."
                     return make_response({
                         "status": "ready",
@@ -476,7 +481,7 @@ async def chat_endpoint(request):
                         "ready_for_review": True
                     })
                 else:
-                    next_fld = dp.get_next_field(single_form, single_answers)
+                    next_fld = dp.get_next_field(single_schema, single_answers)
                     question = dp.get_question_for_field(single_form, next_fld) if next_fld else ""
                     if single_answers:
                         overview_msg = dp.build_form_overview_message(single_form, accepted=single_answers)
@@ -596,7 +601,7 @@ async def chat_endpoint(request):
                 return make_response({
                     "status": "in_progress",
                     "reply": reply,
-                    "form": first_inc["schema"],
+                    "form": dp.fetch_form_schema(first_inc["form_key"]),
                     "form_key": first_inc["form_key"],
                     "answers": first_inc["fields"],
                     "current_field": next_fld,
@@ -752,7 +757,7 @@ async def chat_endpoint(request):
             return make_response({
                 "status": "in_progress",
                 "reply": reply,
-                "form": first_inc["schema"],
+                "form": dp.fetch_form_schema(first_inc["form_key"]),
                 "form_key": first_inc["form_key"],
                 "answers": first_inc["fields"],
                 "current_field": next_fld,
@@ -815,6 +820,18 @@ async def submit_form_endpoint(request):
         return JSONResponse({"error": "Invalid JSON"}, status_code=400)
 
     answers = dict(body.get("answers") or {})
+    for fld in form["schema"].get("fields", []):
+        fname = fld.get("name", "")
+        val = answers.get(fname)
+        if val is not None and str(val).strip() and ("vehicle" in fname.lower() or "plate" in fname.lower()):
+            clean_plate = str(val).strip()
+            if not dp.is_valid_indian_plate(clean_plate):
+                return JSONResponse(
+                    {"error": f"Please enter a valid Indian vehicle number plate for {fld.get('label', fname)} (e.g. MH 12 AB 1234)."},
+                    status_code=400,
+                )
+            answers[fname] = dp.normalize_plate(clean_plate)
+
     final_data = dp.build_final_data(form["schema"], answers)
     submission_id = dp.submit_form(form["id"], final_data)
 
@@ -827,10 +844,37 @@ async def submit_form_endpoint(request):
         conn = dp.get_connection()
         try:
             with conn:
-                conn.execute(
-                    "UPDATE chats SET completed = 1, submission_id = ?, updated_at = ? WHERE id = ?",
-                    (submission_id, dp.utc_now(), chat_id)
-                )
+                chat_row = conn.execute(
+                    "SELECT messages_json FROM chats WHERE id = ?",
+                    (chat_id,)
+                ).fetchone()
+                if chat_row:
+                    try:
+                        messages = json.loads(chat_row["messages_json"] or "[]")
+                    except Exception:
+                        messages = []
+                    messages.append({
+                        "role": "assistant",
+                        "content": f"All done! Your **{form['form_name']}** has been recorded.",
+                        "receipt_data": {
+                            "submission_id": submission_id,
+                            "answers": answers,
+                        }
+                    })
+                    conn.execute(
+                        """
+                        UPDATE chats
+                        SET messages_json = ?,
+                            answers_json = '{}',
+                            form_key = NULL,
+                            current_field_name = NULL,
+                            completed = 1,
+                            submission_id = ?,
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (json.dumps(messages), submission_id, dp.utc_now(), chat_id)
+                    )
         except Exception as exc:
             log.warning("Failed to link chat submission: %s", exc)
         finally:

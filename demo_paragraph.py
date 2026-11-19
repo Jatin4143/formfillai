@@ -111,9 +111,12 @@ RULES:
 4. If asking for help, briefly state that you can help fill forms and prompt them to pick a form or provide details.
 """
 
-INDIAN_PLATE_PATTERN = r"^[A-Z]{2}[ -]?\d{1,2}[ -]?[A-Z]{1,3}[ -]?\d{1,4}$"
+INDIAN_PLATE_PATTERN = r"^(?:[A-Z]{2}[ -]?\d{1,2}[ -]?[A-Z]{1,3}[ -]?\d{1,4}|\d{2}[ -]?BH[ -]?\d{4}[ -]?[A-HJ-NP-Z]{1,2})$"
 INDIAN_PLATE_RE = re.compile(INDIAN_PLATE_PATTERN, re.IGNORECASE)
-INDIAN_PLATE_EXTRACT_RE = re.compile(r"\b([A-Z]{2}[ -]?\d{1,2}[ -]?[A-Z]{1,3}[ -]?\d{1,4})\b", re.IGNORECASE)
+INDIAN_PLATE_EXTRACT_RE = re.compile(
+    r"\b([A-Z]{2}[ -]?\d{1,2}[ -]?[A-Z]{1,3}[ -]?\d{1,4}|\d{2}[ -]?BH[ -]?\d{4}[ -]?[A-HJ-NP-Z]{1,2})\b",
+    re.IGNORECASE,
+)
 
 EMAIL_RE = re.compile(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$")
 PHONE_RE = re.compile(r"^\+?[0-9\s\-()]{7,20}$")
@@ -374,62 +377,65 @@ def init_db():
                     updated_at TEXT NOT NULL
                 );
             """)
-            conn.executescript("""
-                INSERT OR IGNORE INTO forms (key, name, aliases) VALUES
-                ('add_notice', 'Add Notice',
-                 '["add notice", "notice", "new notice", "create notice"]'),
-                ('visitor_entry', 'Visitor Entry',
-                 '["visitor entry", "visitor", "guest", "add visitor", "visitor pass"]'),
-                ('raise_complaint', 'Raise Complaint',
-                 '["raise complaint", "complaint", "issue", "report issue", "problem"]');
+            # Seed default forms only when the forms table is empty so restarts
+            # do not inflate SQLite AUTOINCREMENT sequences via INSERT OR IGNORE.
+            if conn.execute("SELECT COUNT(*) FROM forms").fetchone()[0] == 0:
+                conn.executescript("""
+                    INSERT OR IGNORE INTO forms (key, name, aliases) VALUES
+                    ('add_notice', 'Add Notice',
+                     '["add notice", "notice", "new notice", "create notice"]'),
+                    ('visitor_entry', 'Visitor Entry',
+                     '["visitor entry", "visitor", "guest", "add visitor", "visitor pass"]'),
+                    ('raise_complaint', 'Raise Complaint',
+                     '["raise complaint", "complaint", "issue", "report issue", "problem"]');
 
-                -- Add Notice
-                INSERT OR IGNORE INTO form_fields (form_id, name, label, type, required, options, sort_order)
-                SELECT id, 'wing', 'Wing', 'select', 0, '["All", "A Wing", "B Wing", "C Wing"]', 1
-                FROM forms WHERE key = 'add_notice';
+                    -- Add Notice
+                    INSERT OR IGNORE INTO form_fields (form_id, name, label, type, required, options, sort_order)
+                    SELECT id, 'wing', 'Wing', 'select', 0, '["All", "A Wing", "B Wing", "C Wing"]', 1
+                    FROM forms WHERE key = 'add_notice';
 
-                INSERT OR IGNORE INTO form_fields (form_id, name, label, type, required, options, sort_order)
-                SELECT id, 'subject', 'Subject', 'text', 1, NULL, 2
-                FROM forms WHERE key = 'add_notice';
+                    INSERT OR IGNORE INTO form_fields (form_id, name, label, type, required, options, sort_order)
+                    SELECT id, 'subject', 'Subject', 'text', 1, NULL, 2
+                    FROM forms WHERE key = 'add_notice';
 
-                INSERT OR IGNORE INTO form_fields (form_id, name, label, type, required, options, sort_order)
-                SELECT id, 'description', 'Description', 'textarea', 1, NULL, 3
-                FROM forms WHERE key = 'add_notice';
+                    INSERT OR IGNORE INTO form_fields (form_id, name, label, type, required, options, sort_order)
+                    SELECT id, 'description', 'Description', 'textarea', 1, NULL, 3
+                    FROM forms WHERE key = 'add_notice';
 
-                -- Visitor Entry
-                INSERT OR IGNORE INTO form_fields (form_id, name, label, type, required, options, sort_order)
-                SELECT id, 'visitor_name', 'Visitor Name', 'text', 1, NULL, 1
-                FROM forms WHERE key = 'visitor_entry';
+                    -- Visitor Entry
+                    INSERT OR IGNORE INTO form_fields (form_id, name, label, type, required, options, sort_order)
+                    SELECT id, 'visitor_name', 'Visitor Name', 'text', 1, NULL, 1
+                    FROM forms WHERE key = 'visitor_entry';
 
-                INSERT OR IGNORE INTO form_fields (form_id, name, label, type, required, options, sort_order)
-                SELECT id, 'flat_number', 'Flat Number', 'text', 1, NULL, 2
-                FROM forms WHERE key = 'visitor_entry';
+                    INSERT OR IGNORE INTO form_fields (form_id, name, label, type, required, options, sort_order)
+                    SELECT id, 'flat_number', 'Flat Number', 'text', 1, NULL, 2
+                    FROM forms WHERE key = 'visitor_entry';
 
-                INSERT OR IGNORE INTO form_fields (form_id, name, label, type, required, options, sort_order)
-                SELECT id, 'purpose', 'Purpose', 'select', 1, '["Guest", "Delivery", "Service", "Other"]', 3
-                FROM forms WHERE key = 'visitor_entry';
+                    INSERT OR IGNORE INTO form_fields (form_id, name, label, type, required, options, sort_order)
+                    SELECT id, 'purpose', 'Purpose', 'select', 1, '["Guest", "Delivery", "Service", "Other"]', 3
+                    FROM forms WHERE key = 'visitor_entry';
 
-                INSERT OR IGNORE INTO form_fields (form_id, name, label, type, required, options, sort_order)
-                SELECT id, 'vehicle_number', 'Vehicle Number', 'text', 0, NULL, 4
-                FROM forms WHERE key = 'visitor_entry';
+                    INSERT OR IGNORE INTO form_fields (form_id, name, label, type, required, options, sort_order)
+                    SELECT id, 'vehicle_number', 'Vehicle Number', 'text', 0, NULL, 4
+                    FROM forms WHERE key = 'visitor_entry';
 
-                -- Raise Complaint
-                INSERT OR IGNORE INTO form_fields (form_id, name, label, type, required, options, sort_order)
-                SELECT id, 'category', 'Category', 'select', 1, '["Water", "Electricity", "Lift", "Parking", "Other"]', 1
-                FROM forms WHERE key = 'raise_complaint';
+                    -- Raise Complaint
+                    INSERT OR IGNORE INTO form_fields (form_id, name, label, type, required, options, sort_order)
+                    SELECT id, 'category', 'Category', 'select', 1, '["Water", "Electricity", "Lift", "Parking", "Other"]', 1
+                    FROM forms WHERE key = 'raise_complaint';
 
-                INSERT OR IGNORE INTO form_fields (form_id, name, label, type, required, options, sort_order)
-                SELECT id, 'flat_number', 'Flat Number', 'text', 1, NULL, 2
-                FROM forms WHERE key = 'raise_complaint';
+                    INSERT OR IGNORE INTO form_fields (form_id, name, label, type, required, options, sort_order)
+                    SELECT id, 'flat_number', 'Flat Number', 'text', 1, NULL, 2
+                    FROM forms WHERE key = 'raise_complaint';
 
-                INSERT OR IGNORE INTO form_fields (form_id, name, label, type, required, options, sort_order)
-                SELECT id, 'details', 'Details', 'textarea', 1, NULL, 3
-                FROM forms WHERE key = 'raise_complaint';
+                    INSERT OR IGNORE INTO form_fields (form_id, name, label, type, required, options, sort_order)
+                    SELECT id, 'details', 'Details', 'textarea', 1, NULL, 3
+                    FROM forms WHERE key = 'raise_complaint';
 
-                INSERT OR IGNORE INTO form_fields (form_id, name, label, type, required, options, sort_order)
-                SELECT id, 'urgency', 'Urgency', 'select', 0, '["Low", "Medium", "High"]', 4
-                FROM forms WHERE key = 'raise_complaint';
-            """)
+                    INSERT OR IGNORE INTO form_fields (form_id, name, label, type, required, options, sort_order)
+                    SELECT id, 'urgency', 'Urgency', 'select', 0, '["Low", "Medium", "High"]', 4
+                    FROM forms WHERE key = 'raise_complaint';
+                """)
     except sqlite3.Error as exc:
         log.error("Failed to initialize database: %s", exc)
     finally:
@@ -741,9 +747,9 @@ def validate_answer(field, user_input):
             return True, None
         if is_valid_indian_plate(cleaned):
             return True, normalize_plate(cleaned)
-        if re.match(r"^[A-Za-z0-9\s-]{4,15}$", cleaned):
-            return True, cleaned.upper()
-        return False, "Please enter a valid registration plate number, or type 'skip'."
+        if not required:
+            return False, "Please enter a valid Indian vehicle number plate (e.g. MH 12 AB 1234 or 22 BH 1234 AA), or type 'skip'."
+        return False, "Please enter a valid Indian vehicle number plate (e.g. MH 12 AB 1234 or 22 BH 1234 AA)."
 
     # 3. Email address
     if field_type == "email" or "email" in field_name:

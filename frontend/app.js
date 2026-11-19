@@ -299,6 +299,7 @@
       if (existing) {
         existing.title = data.chat_title;
         existing.form_key = data.form_key || activeFormKey;
+        existing.updated_at = new Date().toISOString();
       } else {
         chats.unshift({
           id: activeChatId,
@@ -739,6 +740,8 @@
     if (reviewModal) reviewModal.classList.remove('modal-dialog-batch');
   }
 
+  const INDIAN_PLATE_RE = /^(?:[A-Z]{2}[ -]?\d{1,2}[ -]?[A-Z]{1,3}[ -]?\d{1,4}|\d{2}[ -]?BH[ -]?\d{4}[ -]?[A-HJ-NP-Z]{1,2})$/i;
+
   async function submitReviewedForm() {
     if (isBatchMode && activeActions.length > 0) {
       const items = [];
@@ -760,6 +763,15 @@
             if (input) input.focus();
             hasValidationError = true;
             return;
+          }
+          if (val && (f.name.toLowerCase().includes('vehicle') || f.name.toLowerCase().includes('plate'))) {
+            if (!INDIAN_PLATE_RE.test(val)) {
+              showToast(`Please enter a valid Indian vehicle number plate for "${f.label}" (e.g. MH 12 AB 1234)`, 'error');
+              if (input) input.focus();
+              hasValidationError = true;
+              return;
+            }
+            val = val.replace(/\s+/g, ' ').toUpperCase();
           }
           cardAnswers[f.name] = val || null;
         }
@@ -835,13 +847,22 @@
       updatedAnswers[f.name] = val || null;
     }
 
-    // Check required fields
+    // Check required fields and Indian vehicle plate format
     for (const f of fields) {
       if (f.required && !updatedAnswers[f.name]) {
         showToast(`Please provide a value for "${f.label}"`, 'error');
         const input = modalEditForm.querySelector(`[name="${f.name}"]`);
         if (input) input.focus();
         return;
+      }
+      if (updatedAnswers[f.name] && (f.name.toLowerCase().includes('vehicle') || f.name.toLowerCase().includes('plate'))) {
+        if (!INDIAN_PLATE_RE.test(updatedAnswers[f.name])) {
+          showToast(`Please enter a valid Indian vehicle number plate for "${f.label}" (e.g. MH 12 AB 1234)`, 'error');
+          const input = modalEditForm.querySelector(`[name="${f.name}"]`);
+          if (input) input.focus();
+          return;
+        }
+        updatedAnswers[f.name] = updatedAnswers[f.name].replace(/\s+/g, ' ').toUpperCase();
       }
     }
 
@@ -858,9 +879,8 @@
         body: JSON.stringify({ answers: updatedAnswers, chat_id: activeChatId }),
       });
 
-      if (!res.ok) throw new Error('Submission failed');
-
       const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Submission failed');
 
       closeReviewModal();
       showToast(`Form submitted successfully as #${data.submission_id}!`, 'success');
@@ -968,6 +988,31 @@
     }
   }
 
+  function parseChatDate(value) {
+    if (!value) return null;
+    let str = String(value).trim();
+    // Normalize SQLite CURRENT_TIMESTAMP ("YYYY-MM-DD HH:MM:SS", UTC)
+    if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(str)) {
+      str = str.replace(' ', 'T') + 'Z';
+    }
+    const d = new Date(str);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+
+  function getChatDateGroup(updatedAt) {
+    const d = parseChatDate(updatedAt);
+    if (!d) return 'Older';
+
+    const now = new Date();
+    const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const yesterdayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+    const chatDayStart = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+
+    if (chatDayStart >= todayStart) return 'Today';
+    if (chatDayStart >= yesterdayStart) return 'Yesterday';
+    return 'Older';
+  }
+
   function renderChatsList() {
     if (!chatsList) return;
     chatsList.innerHTML = '';
@@ -977,7 +1022,45 @@
       return;
     }
 
-    chats.forEach((chat) => {
+    const sortedChats = [...chats].sort((a, b) => {
+      const da = parseChatDate(a.updated_at);
+      const db = parseChatDate(b.updated_at);
+      return (db ? db.getTime() : 0) - (da ? da.getTime() : 0);
+    });
+
+    const groups = {
+      Today: [],
+      Yesterday: [],
+      Older: [],
+    };
+
+    sortedChats.forEach((chat) => {
+      const groupName = getChatDateGroup(chat.updated_at);
+      groups[groupName].push(chat);
+    });
+
+    ['Today', 'Yesterday', 'Older'].forEach((groupName) => {
+      const groupChats = groups[groupName];
+      if (!groupChats.length) return;
+
+      const groupEl = document.createElement('div');
+      groupEl.className = 'chat-history-group';
+
+      const labelEl = document.createElement('div');
+      labelEl.className = 'chat-group-label';
+      labelEl.textContent = groupName;
+      groupEl.appendChild(labelEl);
+
+      groupChats.forEach((chat) => {
+        const item = createChatListItem(chat);
+        groupEl.appendChild(item);
+      });
+
+      chatsList.appendChild(groupEl);
+    });
+  }
+
+  function createChatListItem(chat) {
       const item = document.createElement('div');
       item.className = `chat-item ${chat.id === activeChatId ? 'active' : ''}`;
       item.dataset.id = chat.id;
@@ -1077,8 +1160,7 @@
         });
       }
 
-      chatsList.appendChild(item);
-    });
+      return item;
   }
 
   function createNewChat(notify = true) {
@@ -1138,7 +1220,7 @@
       } else {
         if (welcomeCard) welcomeCard.style.display = 'none';
         msgs.forEach((m) => {
-          appendMessage(m.role, m.content);
+          appendMessage(m.role, m.content, m.receipt_data || null);
         });
       }
 
