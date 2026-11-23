@@ -629,13 +629,13 @@
         input.className = 'modal-input';
         input.name = field.name;
         input.value = val;
-        if (field.type === 'date' && val && !input.value) {
+        if (field.type === 'date' && val) {
           const d = new Date(val);
           if (!isNaN(d.getTime())) {
-            const y = d.getFullYear() <= 2001 ? new Date().getFullYear() : d.getFullYear();
-            const m = String(d.getMonth() + 1).padStart(2, '0');
-            const day = String(d.getDate()).padStart(2, '0');
-            input.value = `${y}-${m}-${day}`;
+            const y = d.getFullYear();
+            if (y < 1900 || y > 2100) {
+              input.value = '';
+            }
           }
         }
         if (field.name === 'vehicle_number') {
@@ -730,13 +730,13 @@
           input.className = 'modal-input';
           input.dataset.fieldName = field.name;
           input.value = val;
-          if (field.type === 'date' && val && !input.value) {
+          if (field.type === 'date' && val) {
             const d = new Date(val);
             if (!isNaN(d.getTime())) {
-              const y = d.getFullYear() <= 2001 ? new Date().getFullYear() : d.getFullYear();
-              const m = String(d.getMonth() + 1).padStart(2, '0');
-              const day = String(d.getDate()).padStart(2, '0');
-              input.value = `${y}-${m}-${day}`;
+              const y = d.getFullYear();
+              if (y < 1900 || y > 2100) {
+                input.value = '';
+              }
             }
           }
           fieldCard.appendChild(input);
@@ -790,6 +790,23 @@
               return;
             }
             val = val.replace(/\s+/g, ' ').toUpperCase();
+          }
+          if (val && (f.type === 'date' || f.name.toLowerCase().includes('date'))) {
+            const dateMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(val);
+            if (dateMatch) {
+              const yr = parseInt(dateMatch[1], 10);
+              if (yr < 1900 || yr > 2100) {
+                showToast(`Please enter a valid year (1900-2100) for "${f.label}"`, 'error');
+                if (input) input.focus();
+                hasValidationError = true;
+                return;
+              }
+            } else {
+              showToast(`Please enter a valid date (YYYY-MM-DD) for "${f.label}"`, 'error');
+              if (input) input.focus();
+              hasValidationError = true;
+              return;
+            }
           }
           cardAnswers[f.name] = val || null;
         }
@@ -881,6 +898,24 @@
           return;
         }
         updatedAnswers[f.name] = updatedAnswers[f.name].replace(/\s+/g, ' ').toUpperCase();
+      }
+      if (updatedAnswers[f.name] && (f.type === 'date' || f.name.toLowerCase().includes('date'))) {
+        const dVal = updatedAnswers[f.name];
+        const dateMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dVal);
+        if (dateMatch) {
+          const yr = parseInt(dateMatch[1], 10);
+          if (yr < 1900 || yr > 2100) {
+            showToast(`Please enter a valid year (1900-2100) for "${f.label}"`, 'error');
+            const input = modalEditForm.querySelector(`[name="${f.name}"]`);
+            if (input) input.focus();
+            return;
+          }
+        } else {
+          showToast(`Please enter a valid date (YYYY-MM-DD) for "${f.label}"`, 'error');
+          const input = modalEditForm.querySelector(`[name="${f.name}"]`);
+          if (input) input.focus();
+          return;
+        }
       }
     }
 

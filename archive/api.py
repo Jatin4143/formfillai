@@ -2,7 +2,7 @@
 """
 Server bridge for FieldFlow AI Form Assistant.
 Exposes REST API endpoints and serves the static frontend from the /frontend directory.
-Wraps core logic from demo_paragraph.py without modifying or deleting existing files.
+Uses modular business logic from the core/ package.
 """
 
 import json
@@ -21,8 +21,12 @@ from starlette.staticfiles import StaticFiles
 import uvicorn
 
 from config import BASE_DIR, FRONTEND_DIR, PORT
-import demo_paragraph as dp
-import multi_form_planner as mfp
+from core import db, validation, intent, extractor, questions, chat_session
+from core.multi_form_planner import (
+    plan_and_extract,
+    execute_batch_submission,
+    generate_conversational_reply,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("server")
@@ -42,7 +46,7 @@ def save_chat_interaction(chat_id, user_text, reply, form_key, answers, current_
     if not chat_id:
         chat_id = str(uuid.uuid4())
 
-    conn = dp.get_connection()
+    conn = db.get_connection()
     try:
         row = conn.execute(
             "SELECT id, title, title_locked, messages_json, answers_json FROM chats WHERE id = ?",
@@ -65,7 +69,7 @@ def save_chat_interaction(chat_id, user_text, reply, form_key, answers, current_
 
         if not title_locked:
             if form_key:
-                meta = dp.form_meta_by_key(form_key)
+                meta = db.form_meta_by_key(form_key)
                 if meta:
                     title = meta["form_name"]
             elif user_text and title in ("New Conversation", "Untitled", ""):
@@ -102,7 +106,7 @@ def save_chat_interaction(chat_id, user_text, reply, form_key, answers, current_
                     field_name,
                     1 if completed else 0,
                     submission_id,
-                    dp.utc_now(),
+                    chat_session.utc_now(),
                 )
             )
         return chat_id, title
@@ -115,7 +119,7 @@ def save_chat_interaction(chat_id, user_text, reply, form_key, answers, current_
 
 async def list_chats_endpoint(request):
     """GET /api/chats - returns all chat sessions sorted by recency."""
-    conn = dp.get_connection()
+    conn = db.get_connection()
     try:
         rows = conn.execute(
             """
@@ -153,7 +157,7 @@ async def create_chat_endpoint(request):
         body = {}
     title = (body.get("title") or "New Conversation").strip()
     new_id = str(uuid.uuid4())
-    conn = dp.get_connection()
+    conn = db.get_connection()
     try:
         with conn:
             conn.execute(
@@ -163,7 +167,7 @@ async def create_chat_endpoint(request):
                     form_key, current_field_name, completed, submission_id, updated_at
                 ) VALUES (?, ?, 0, '[]', '{}', NULL, NULL, 0, NULL, ?)
                 """,
-                (new_id, title, dp.utc_now())
+                (new_id, title, chat_session.utc_now())
             )
         return JSONResponse({
             "id": new_id,
@@ -185,7 +189,7 @@ async def create_chat_endpoint(request):
 async def get_chat_endpoint(request):
     """GET /api/chats/{id} - returns a chat session's full messages and state."""
     chat_id = request.path_params.get("id")
-    conn = dp.get_connection()
+    conn = db.get_connection()
     try:
         row = conn.execute(
             """
@@ -200,7 +204,7 @@ async def get_chat_endpoint(request):
             return JSONResponse({"error": "Chat not found"}, status_code=404)
 
         form_key = row["form_key"]
-        form_data = dp.fetch_form_schema(form_key) if form_key else None
+        form_data = db.fetch_form_schema(form_key) if form_key else None
         field_name = row["current_field_name"]
         current_field = None
         if form_data and field_name:
@@ -242,12 +246,12 @@ async def update_chat_endpoint(request):
     if not new_title:
         return JSONResponse({"error": "Title cannot be empty"}, status_code=400)
 
-    conn = dp.get_connection()
+    conn = db.get_connection()
     try:
         with conn:
             cur = conn.execute(
                 "UPDATE chats SET title = ?, title_locked = 1, updated_at = ? WHERE id = ?",
-                (new_title[:60], dp.utc_now(), chat_id)
+                (new_title[:60], chat_session.utc_now(), chat_id)
             )
             if cur.rowcount == 0:
                 return JSONResponse({"error": "Chat not found"}, status_code=404)
@@ -263,7 +267,7 @@ async def delete_chat_endpoint(request):
     """DELETE /api/chats/{id} - deletes a chat session."""
     chat_id = request.path_params.get("id")
     try:
-        dp.delete_chat_from_db(chat_id)
+        chat_session.delete_chat_from_db(chat_id)
         return JSONResponse({"success": True, "id": chat_id})
     except Exception as exc:
         log.error("Failed to delete chat %s: %s", chat_id, exc)
@@ -272,14 +276,14 @@ async def delete_chat_endpoint(request):
 
 async def list_forms_endpoint(request):
     """GET /api/forms - returns all available forms."""
-    forms = dp.list_forms()
+    forms = db.list_forms()
     return JSONResponse(forms)
 
 
 async def get_form_schema_endpoint(request):
     """GET /api/forms/{key}/schema - returns schema and fields for a form."""
     form_key = request.path_params.get("key")
-    schema = dp.fetch_form_schema(form_key)
+    schema = db.fetch_form_schema(form_key)
     if not schema:
         return JSONResponse({"error": "Form not found"}, status_code=404)
     return JSONResponse(schema)
@@ -293,7 +297,7 @@ def is_probable_multi_action(user_text: str) -> bool:
             return True
 
     try:
-        forms = dp.list_forms()
+        forms = db.list_forms()
         form_matches = 0
         for f in forms:
             f_name = f.get("name", "").lower()
@@ -314,11 +318,11 @@ def is_probable_multi_action(user_text: str) -> bool:
 
 def should_switch_to_form(user_text, current_form_key):
     """Check if user wants to switch to a different form without relying on streamlit session_state."""
-    detected_key = dp.detect_form_key(user_text)
+    detected_key = intent.detect_form_key(user_text)
     if not detected_key or detected_key == current_form_key:
         return None
-    meta = dp.form_meta_by_key(detected_key)
-    if meta and dp.message_is_only_form_name(user_text, meta):
+    meta = db.form_meta_by_key(detected_key)
+    if meta and intent.message_is_only_form_name(user_text, meta):
         return detected_key
     return None
 
@@ -363,7 +367,7 @@ async def chat_endpoint(request):
         return JSONResponse({"error": "Empty message"}, status_code=400)
 
     # 1. Handle cancel / reset command
-    if dp.is_cancel_command(user_text):
+    if intent.is_cancel_command(user_text):
         reply = "Current form filling was cancelled. Let me know whenever you'd like to fill a form."
         return make_response({
             "status": "cancelled",
@@ -378,11 +382,11 @@ async def chat_endpoint(request):
     # 2. If no form is currently active
     if not form_key:
         # Check if user message is purely greeting, pleasantry, or conversational question
-        if dp.is_greeting_or_smalltalk(user_text) or any(w in user_text.lower().split() for w in ("hy", "helo", "hiii", "hey", "hello", "hi")):
+        if intent.is_greeting_or_smalltalk(user_text) or any(w in user_text.lower().split() for w in ("hy", "helo", "hiii", "hey", "hello", "hi")):
             # Check first if they also gave actual form details (e.g. "hi, flat B-204 tap leak")
-            direct_key = dp.detect_form_key(user_text)
+            direct_key = intent.detect_form_key(user_text)
             if not direct_key and len(user_text.split()) < 12:
-                model_reply = mfp.generate_conversational_reply(user_text)
+                model_reply = generate_conversational_reply(user_text)
                 return make_response({
                     "status": "greeting",
                     "reply": model_reply,
@@ -394,15 +398,15 @@ async def chat_endpoint(request):
                 })
 
         # Fast path: Check if user message directly selects a form from DB (e.g. "add notice", "visitor entry")
-        direct_key = dp.detect_form_key(user_text)
+        direct_key = intent.detect_form_key(user_text)
         if direct_key:
-            form = dp.fetch_form_schema(direct_key)
-            if form and dp.message_is_only_form_name(user_text, form):
+            form = db.fetch_form_schema(direct_key)
+            if form and intent.message_is_only_form_name(user_text, form):
                 answers = {}
                 if direct_key == "add_notice":
                     answers["wing"] = "All"
-                first_field = dp.get_next_field(form["schema"], answers)
-                question = dp.get_question_for_field(form, first_field) if first_field else ""
+                first_field = extractor.get_next_field(form["schema"], answers)
+                question = questions.get_question_for_field(form, first_field) if first_field else ""
                 reply = f"Let's fill out **{form['form_name']}**.\n\n{question}"
                 return make_response({
                     "status": "in_progress",
@@ -417,7 +421,7 @@ async def chat_endpoint(request):
                 })
 
         # Check multi-form planner for multi-action batch or paragraph extraction
-        plan = mfp.plan_and_extract(user_text)
+        plan = plan_and_extract(user_text)
         if plan and plan.get("actions"):
             if plan["is_multi_action"]:
                 # Multi-record / compound plan (e.g. 3 complaints or visitors + complaint)
@@ -447,7 +451,7 @@ async def chat_endpoint(request):
                     return make_response({
                         "status": "in_progress",
                         "reply": reply,
-                        "form": dp.fetch_form_schema(first_inc["form_key"]),
+                        "form": db.fetch_form_schema(first_inc["form_key"]),
                         "form_key": first_inc["form_key"],
                         "answers": first_inc["fields"],
                         "current_field": next_fld,
@@ -459,7 +463,7 @@ async def chat_endpoint(request):
             else:
                 # Single action identified by the planner
                 act = plan["actions"][0]
-                single_form = dp.fetch_form_schema(act["form_key"]) or {
+                single_form = db.fetch_form_schema(act["form_key"]) or {
                     "key": act["form_key"],
                     "form_name": act["form_name"],
                     "schema": act["schema"],
@@ -470,7 +474,7 @@ async def chat_endpoint(request):
                     k: v for k, v in (act.get("fields") or {}).items()
                     if v is not None and str(v).strip() != "" and str(v).lower() != "null"
                 }
-                if act.get("is_complete") and dp.get_next_field(single_schema, single_answers) is None:
+                if act.get("is_complete") and extractor.get_next_field(single_schema, single_answers) is None:
                     reply = f"🎉 **All details have been extracted for {act['form_name']}!** Please review and confirm in the pop-up modal."
                     return make_response({
                         "status": "ready",
@@ -484,10 +488,10 @@ async def chat_endpoint(request):
                         "ready_for_review": True
                     })
                 else:
-                    next_fld = dp.get_next_field(single_schema, single_answers)
-                    question = dp.get_question_for_field(single_form, next_fld) if next_fld else ""
+                    next_fld = extractor.get_next_field(single_schema, single_answers)
+                    question = questions.get_question_for_field(single_form, next_fld) if next_fld else ""
                     if single_answers:
-                        overview_msg = dp.build_form_overview_message(single_form, accepted=single_answers)
+                        overview_msg = questions.build_form_overview_message(single_form, accepted=single_answers)
                         reply = f"{overview_msg}\n\n{question}"
                     else:
                         reply = f"Let's fill out **{single_form['form_name']}**.\n\n{question}"
@@ -503,15 +507,15 @@ async def chat_endpoint(request):
                         "ready_for_review": False
                     })
 
-        direct_key = dp.detect_form_key(user_text)
+        direct_key = intent.detect_form_key(user_text)
         detected_key = direct_key
         prefilled = {}
 
         if not detected_key:
-            detected_key, prefilled = dp.classify_and_extract(user_text)
+            detected_key, prefilled = extractor.classify_and_extract(user_text)
 
         if not detected_key:
-            reply = dp.chatbot_help_reply(user_text, dp.list_forms())
+            reply = questions.chatbot_help_reply(user_text, db.list_forms())
             return make_response({
                 "status": "help",
                 "reply": reply,
@@ -523,26 +527,26 @@ async def chat_endpoint(request):
             })
 
         # Start selected form
-        form = dp.fetch_form_schema(detected_key)
+        form = db.fetch_form_schema(detected_key)
         if not form:
             return JSONResponse({"error": "Form not found"}, status_code=404)
 
         answers = {}
         accepted = {}
         if prefilled:
-            accepted = dp.merge_extracted_fields(form["schema"], prefilled, answers)
-        if dp.get_next_field(form["schema"], answers) is not None and not dp.message_is_only_form_name(user_text, form) and not dp.is_greeting_or_smalltalk(user_text):
-            more_accepted = dp.apply_extracted_answers(form["schema"], user_text, answers)
+            accepted = extractor.merge_extracted_fields(form["schema"], prefilled, answers)
+        if extractor.get_next_field(form["schema"], answers) is not None and not intent.message_is_only_form_name(user_text, form) and not intent.is_greeting_or_smalltalk(user_text):
+            more_accepted = extractor.apply_extracted_answers(form["schema"], user_text, answers)
             accepted.update(more_accepted)
 
         if detected_key == "add_notice" and "wing" not in answers:
             answers["wing"] = "All"
 
-        next_field = dp.get_next_field(form["schema"], answers)
+        next_field = extractor.get_next_field(form["schema"], answers)
 
         if next_field is None:
             # All fields collected on first message!
-            overview_msg = dp.build_form_overview_message(form, accepted=accepted)
+            overview_msg = questions.build_form_overview_message(form, accepted=accepted)
             reply = f"{overview_msg}\n\n🎉 **All details have been extracted!** Please review and confirm in the pop-up modal."
             return make_response({
                 "status": "ready",
@@ -555,9 +559,9 @@ async def chat_endpoint(request):
                 "accepted": accepted
             })
         else:
-            question = dp.get_question_for_field(form, next_field)
+            question = questions.get_question_for_field(form, next_field)
             if accepted:
-                overview_msg = dp.build_form_overview_message(form, accepted=accepted)
+                overview_msg = questions.build_form_overview_message(form, accepted=accepted)
                 reply = f"{overview_msg}\n\n{question}"
             else:
                 reply = f"Let's fill out **{form['form_name']}**.\n\n{question}"
@@ -573,13 +577,13 @@ async def chat_endpoint(request):
             })
 
     # 3. An active form exists
-    form = dp.fetch_form_schema(form_key)
+    form = db.fetch_form_schema(form_key)
     if not form:
         return JSONResponse({"error": "Active form not found"}, status_code=404)
 
     # If user provided a batch/compound multi-form request mid-way
     if is_probable_multi_action(user_text):
-        plan = mfp.plan_and_extract(user_text)
+        plan = plan_and_extract(user_text)
         if plan and plan.get("is_multi_action"):
             if plan["all_complete"]:
                 reply = f"🎉 **Identified and extracted {len(plan['actions'])} items!** Please review and confirm in the pop-up modal."
@@ -607,7 +611,7 @@ async def chat_endpoint(request):
                 return make_response({
                     "status": "in_progress",
                     "reply": reply,
-                    "form": dp.fetch_form_schema(first_inc["form_key"]),
+                    "form": db.fetch_form_schema(first_inc["form_key"]),
                     "form_key": first_inc["form_key"],
                     "answers": first_inc["fields"],
                     "current_field": next_fld,
@@ -620,15 +624,15 @@ async def chat_endpoint(request):
     # Check if user wants to switch form mid-way
     switch_key = should_switch_to_form(user_text, form_key)
     if switch_key and switch_key != form_key:
-        new_form = dp.fetch_form_schema(switch_key)
+        new_form = db.fetch_form_schema(switch_key)
         new_answers = {}
         accepted = {}
-        if not dp.message_is_only_form_name(user_text, new_form):
-            accepted = dp.apply_extracted_answers(new_form["schema"], user_text, new_answers)
+        if not intent.message_is_only_form_name(user_text, new_form):
+            accepted = extractor.apply_extracted_answers(new_form["schema"], user_text, new_answers)
         if switch_key == "add_notice" and "wing" not in new_answers:
             new_answers["wing"] = "All"
-        overview_msg = dp.build_form_overview_message(new_form, accepted=accepted)
-        next_field = dp.get_next_field(new_form["schema"], new_answers)
+        overview_msg = questions.build_form_overview_message(new_form, accepted=accepted)
+        next_field = extractor.get_next_field(new_form["schema"], new_answers)
         if next_field is None:
             reply = f"{overview_msg}\n\n🎉 **All details extracted for {new_form['form_name']}!** Please review in the pop-up modal."
             return make_response({
@@ -642,7 +646,7 @@ async def chat_endpoint(request):
                 "accepted": accepted
             })
         else:
-            question = dp.get_question_for_field(new_form, next_field)
+            question = questions.get_question_for_field(new_form, next_field)
             reply = f"{overview_msg}\n\n{question}"
             return make_response({
                 "status": "in_progress",
@@ -656,10 +660,10 @@ async def chat_endpoint(request):
             })
 
     # Mid-form conversational / smalltalk check
-    if dp.is_greeting_or_smalltalk(user_text) or any(w in user_text.lower().split() for w in ("hy", "helo", "hiii", "hey", "hello", "hi")):
+    if intent.is_greeting_or_smalltalk(user_text) or any(w in user_text.lower().split() for w in ("hy", "helo", "hiii", "hey", "hello", "hi")):
         if not (current_field and not current_field.get("required", True) and user_text.strip().lower() in ("no", "none", "skip", "na", "n/a", "nil")):
             label = current_field["label"] if current_field else "the next field"
-            conv_reply = mfp.generate_conversational_reply(user_text)
+            conv_reply = generate_conversational_reply(user_text)
             reply = f"{conv_reply}\n\nWe are currently filling out **{form['form_name']}** — please provide {label.lower()} to continue, or type 'cancel' to exit."
             return make_response({
                 "status": "in_progress",
@@ -682,7 +686,7 @@ async def chat_endpoint(request):
 
     # 1. If currently waiting for a specific field, test direct validation first
     if is_field_unanswered:
-        ok, val = dp.validate_answer(current_field, user_text)
+        ok, val = validation.validate_answer(current_field, user_text)
         if ok:
             answers[f_name] = val
             accepted[f_name] = val
@@ -690,12 +694,12 @@ async def chat_endpoint(request):
 
     # 2. If the user provided a compound message that might contain other fields as well (not just answering current_field)
     if not direct_match or (any(c in user_text for c in (",", "\n", ";")) or " and " in user_text.lower()):
-        extracted = dp.apply_extracted_answers(form["schema"], user_text, answers)
+        extracted = extractor.apply_extracted_answers(form["schema"], user_text, answers)
         accepted.update(extracted)
 
     # 3. If neither direct validation nor extraction succeeded for the current field
     if is_field_unanswered and (f_name not in answers or answers[f_name] is None or str(answers[f_name]).strip() == ""):
-        ok, val = dp.validate_answer(current_field, user_text)
+        ok, val = validation.validate_answer(current_field, user_text)
         if not ok and not accepted:
             return make_response({
                 "status": "validation_error",
@@ -765,7 +769,7 @@ async def chat_endpoint(request):
             return make_response({
                 "status": "in_progress",
                 "reply": reply,
-                "form": dp.fetch_form_schema(first_inc["form_key"]),
+                "form": db.fetch_form_schema(first_inc["form_key"]),
                 "form_key": first_inc["form_key"],
                 "answers": first_inc["fields"],
                 "current_field": next_fld,
@@ -776,10 +780,10 @@ async def chat_endpoint(request):
             })
 
     # Check next missing field (for standalone single form)
-    next_field = dp.get_next_field(form["schema"], answers)
+    next_field = extractor.get_next_field(form["schema"], answers)
     msg_prefix = ""
     if len(accepted) > 1:
-        msg_prefix = dp.format_filled_message(form["schema"], answers, accepted) + "\n\n"
+        msg_prefix = questions.format_filled_message(form["schema"], answers, accepted) + "\n\n"
 
     if next_field is None:
         reply = msg_prefix + f"✨ **All fields for {form['form_name']} are complete!**\nOpening the review dialog so you can verify and submit."
@@ -796,7 +800,7 @@ async def chat_endpoint(request):
             "accepted": accepted
         })
 
-    question = dp.get_question_for_field(form, next_field)
+    question = questions.get_question_for_field(form, next_field)
     reply = msg_prefix + question
     return make_response({
         "status": "in_progress",
@@ -818,7 +822,7 @@ async def submit_form_endpoint(request):
     Submits finalized/edited answers from modal into SQLite DB.
     """
     form_key = request.path_params.get("key")
-    form = dp.fetch_form_schema(form_key)
+    form = db.fetch_form_schema(form_key)
     if not form:
         return JSONResponse({"error": "Form not found"}, status_code=404)
 
@@ -830,26 +834,36 @@ async def submit_form_endpoint(request):
     answers = dict(body.get("answers") or {})
     for fld in form["schema"].get("fields", []):
         fname = fld.get("name", "")
+        ftype = fld.get("type", "")
         val = answers.get(fname)
-        if val is not None and str(val).strip() and ("vehicle" in fname.lower() or "plate" in fname.lower()):
-            clean_plate = str(val).strip()
-            if not dp.is_valid_indian_plate(clean_plate):
-                return JSONResponse(
-                    {"error": f"Please enter a valid Indian vehicle number plate for {fld.get('label', fname)} (e.g. MH 12 AB 1234)."},
-                    status_code=400,
-                )
-            answers[fname] = dp.normalize_plate(clean_plate)
+        if val is not None and str(val).strip():
+            clean_str = str(val).strip()
+            if "vehicle" in fname.lower() or "plate" in fname.lower():
+                if not validation.is_valid_indian_plate(clean_str):
+                    return JSONResponse(
+                        {"error": f"Please enter a valid Indian vehicle number plate for {fld.get('label', fname)} (e.g. MH 12 AB 1234)."},
+                        status_code=400,
+                    )
+                answers[fname] = validation.normalize_plate(clean_str)
+            elif ftype == "date" or "date" in fname.lower():
+                clean_date = validation.normalize_date(clean_str)
+                if not clean_date:
+                    return JSONResponse(
+                        {"error": f"Please enter a valid date for {fld.get('label', fname)}."},
+                        status_code=400,
+                    )
+                answers[fname] = clean_date
 
-    final_data = dp.build_final_data(form["schema"], answers)
-    submission_id = dp.submit_form(form["id"], final_data)
+    final_data = extractor.build_final_data(form["schema"], answers)
+    submission_id = db.submit_form(form["id"], final_data)
 
     if not submission_id:
         return JSONResponse({"error": "Database submission failed"}, status_code=500)
 
-    summary = dp.format_completion_message(form["schema"], answers, submission_id)
+    summary = questions.format_completion_message(form["schema"], answers, submission_id)
     chat_id = body.get("chat_id")
     if chat_id:
-        conn = dp.get_connection()
+        conn = db.get_connection()
         try:
             with conn:
                 chat_row = conn.execute(
@@ -881,7 +895,7 @@ async def submit_form_endpoint(request):
                             updated_at = ?
                         WHERE id = ?
                         """,
-                        (json.dumps(messages), submission_id, dp.utc_now(), chat_id)
+                        (json.dumps(messages), submission_id, chat_session.utc_now(), chat_id)
                     )
         except Exception as exc:
             log.warning("Failed to link chat submission: %s", exc)
@@ -908,13 +922,13 @@ async def submit_batch_endpoint(request):
 
     items = body.get("items") or []
     chat_id = body.get("chat_id")
-    result = mfp.execute_batch_submission(items, chat_id=chat_id)
+    result = execute_batch_submission(items, chat_id=chat_id)
     return JSONResponse(result)
 
 
 async def list_submissions_endpoint(request):
     """GET /api/submissions - returns recent submissions from database."""
-    conn = dp.get_connection()
+    conn = db.get_connection()
     try:
         rows = conn.execute("""
             SELECT s.id, s.form_id, f.key as form_key, f.name as form_name, s.answers_json, s.created_at
@@ -939,35 +953,4 @@ async def list_submissions_endpoint(request):
     finally:
         conn.close()
 
-
-routes = [
-    Route("/api/forms", list_forms_endpoint, methods=["GET"]),
-    Route("/api/forms/{key}/schema", get_form_schema_endpoint, methods=["GET"]),
-    Route("/api/chats", list_chats_endpoint, methods=["GET"]),
-    Route("/api/chats", create_chat_endpoint, methods=["POST"]),
-    Route("/api/chats/{id}", get_chat_endpoint, methods=["GET"]),
-    Route("/api/chats/{id}", update_chat_endpoint, methods=["PUT"]),
-    Route("/api/chats/{id}", delete_chat_endpoint, methods=["DELETE"]),
-    Route("/api/chat", chat_endpoint, methods=["POST"]),
-    Route("/api/forms/{key}/submit", submit_form_endpoint, methods=["POST"]),
-    Route("/api/forms/submit-batch", submit_batch_endpoint, methods=["POST"]),
-    Route("/api/submissions", list_submissions_endpoint, methods=["GET"]),
-    Mount("/", app=StaticFiles(directory=str(FRONTEND_DIR), html=True)),
-]
-
-middleware = [
-    Middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_methods=["*"],
-        allow_headers=["*"],
-    ),
-    Middleware(NoCacheMiddleware),
-]
-
-app = Starlette(debug=True, routes=routes, middleware=middleware)
-
-if __name__ == "__main__":
-    log.info("Starting FieldFlow API Server on http://0.0.0.0:%s", PORT)
-    uvicorn.run("server:app", host="0.0.0.0", port=PORT, reload=True)
 

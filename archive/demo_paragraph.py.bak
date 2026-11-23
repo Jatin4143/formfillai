@@ -141,17 +141,30 @@ def normalize_date(text: str) -> str | None:
         return None
     s = text.strip().lower()
     today = date.today()
-    if s == "today":
+    if s in ("today", "tod"):
         return today.isoformat()
-    if s == "tomorrow":
+    if s in ("tomorrow", "tmrw", "tom"):
         return (today + timedelta(days=1)).isoformat()
+    if s in ("day after tomorrow", "day after tmrw"):
+        return (today + timedelta(days=2)).isoformat()
+    if s == "yesterday":
+        return (today - timedelta(days=1)).isoformat()
     if not re.search(r"\d", s):
         return None
     try:
         from dateutil import parser as dt_parser
         is_year_first = bool(re.match(r"^\d{4}[-/.]", s))
-        dt = dt_parser.parse(s, yearfirst=is_year_first, dayfirst=not is_year_first)
-        return dt.date().isoformat()
+        # Use two different default days to detect whether the user actually provided a day
+        def1 = datetime(today.year, 1, 1)
+        def2 = datetime(today.year, 1, 2)
+        dt1 = dt_parser.parse(s, default=def1, yearfirst=is_year_first, dayfirst=not is_year_first)
+        dt2 = dt_parser.parse(s, default=def2, yearfirst=is_year_first, dayfirst=not is_year_first)
+        if dt1.day != dt2.day:
+            return None
+        # Disallow unrealistic years (e.g. ancient years like 0344 or far-future typos)
+        if dt1.year < 1900 or dt1.year > 2100:
+            return None
+        return dt1.date().isoformat()
     except Exception:
         return None
 

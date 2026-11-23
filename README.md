@@ -46,7 +46,7 @@ ollama pull llama3.2:3b
 Start the backend server:
 
 ```bash
-python server.py
+python main.py
 ```
 
 Open in browser:

@@ -18,6 +18,7 @@ import uuid
 
 import ollama
 from config import MODEL, OLLAMA_BASE_URL, DB_PATH, ollama_client
+from core.validation import normalize_date
 
 INDIAN_PLATE_PATTERN = r"^(?:[A-Z]{2}[ -]?\d{1,2}[ -]?[A-Z]{1,3}[ -]?\d{1,4}|\d{2}[ -]?BH[ -]?\d{4}[ -]?[A-HJ-NP-Z]{1,2})$"
 INDIAN_PLATE_RE = re.compile(INDIAN_PLATE_PATTERN, re.IGNORECASE)
@@ -348,8 +349,7 @@ def apply_shared_context_and_validate(plan_result, catalog, user_text=""):
                         else:
                             cleaned_fields[fname] = None
                     elif ftype == "date" or "date" in fname.lower():
-                        import demo_paragraph as dp
-                        cleaned_fields[fname] = dp.normalize_date(clean_str)
+                        cleaned_fields[fname] = normalize_date(clean_str)
                     else:
                         cleaned_fields[fname] = clean_str
                 else:
@@ -485,6 +485,14 @@ def execute_batch_submission(items, chat_id=None):
                                 "error": f"Invalid Indian vehicle number plate: '{clean_plate}' (e.g. MH 12 AB 1234).",
                             }
                         answers[k] = re.sub(r"\s+", " ", clean_plate.upper())
+                    elif v is not None and str(v).strip() and "date" in k.lower():
+                        clean_date = normalize_date(str(v).strip())
+                        if not clean_date:
+                            return {
+                                "success": False,
+                                "error": f"Invalid date: '{v}' for field '{k}'.",
+                            }
+                        answers[k] = clean_date
 
                 row = conn.execute("SELECT id, name FROM forms WHERE key = ?", (fkey,)).fetchone()
                 if not row:
