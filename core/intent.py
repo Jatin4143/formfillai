@@ -14,7 +14,7 @@ GREETING_PATTERNS = [
 GREETING_RE = re.compile("|".join(GREETING_PATTERNS), re.IGNORECASE)
 
 SMALLTALK_PATTERNS = [
-    r"\b(how\s*are\s*you|who\s*are\s*you|what\s*can\s*you\s*do|what\s*do\s*you\s*do|help(\s*me)?|what\s*forms?(\s*do\s*you\s*have)?|show(\s*me)?\s*(forms?|options?|menu)|list(\s*of)?\s*forms?|options?|menu)\b",
+    r"\b(how\s*are\s*you|who\s*are\s*you|what\s*can\s*you\s*do|what\s*do\s*you\s*do|help(\s*me)?|what\s*forms?(\s*do\s*you\s*have)?|show(\s*me)?\s*(?:forms?|options?|menu)|list(\s*of)?\s*(?:forms?|options?|menu))\b",
 ]
 SMALLTALK_RE = re.compile("|".join(SMALLTALK_PATTERNS), re.IGNORECASE)
 

@@ -25,14 +25,19 @@ def main():
     # Get the graph structure, including nested/conditional details.
     graph = service.graph.get_graph(xray=True)
 
-    # Render Mermaid to PNG bytes.
-    png_bytes = graph.draw_mermaid_png()
+    # Save Mermaid text
+    mmd_path = Path(__file__).resolve().parent / "langgraph_workflow.mmd"
+    mmd_path.write_text(graph.draw_mermaid())
+    print(f"LangGraph Mermaid diagram saved to: {mmd_path}")
 
-    # Save the diagram beside this script.
-    output_path = Path(__file__).resolve().parent / "langgraph_workflow.png"
-    output_path.write_bytes(png_bytes)
-
-    print(f"LangGraph diagram saved to: {output_path}")
+    # Try rendering Mermaid to PNG bytes via mermaid.ink if online
+    try:
+        png_bytes = graph.draw_mermaid_png()
+        output_path = Path(__file__).resolve().parent / "langgraph_workflow.png"
+        output_path.write_bytes(png_bytes)
+        print(f"LangGraph diagram saved to: {output_path}")
+    except Exception as e:
+        print(f"Could not render online PNG ({e}). Mermaid syntax is saved to {mmd_path}.")
 
     # Display inline when run in a Jupyter/IPython environment.
     try:

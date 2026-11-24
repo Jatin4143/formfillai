@@ -12,6 +12,13 @@ from core import (
     chat_session,
     multi_form_planner,
     prompts,
+    graph,
+)
+from core.graph import (
+    FormChatState,
+    FormChatService,
+    build_chat_graph,
+    compiled_chat_graph,
 )
 from core.db import (
     get_connection,

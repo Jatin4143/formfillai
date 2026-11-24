@@ -26,6 +26,7 @@ from pathlib import Path
 import ollama
 import streamlit as st
 from core import multi_form_planner as mfp
+from core.graph import FormChatService
 
 from config import (
     MODEL,
